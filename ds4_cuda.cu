@@ -256,19 +256,19 @@ static void ds4_capture_set_stream(cudaStream_t stream) {
  * The three pre-existing helper streams are already NonBlocking. */
 static cudaStream_t g_ds4_graph_stream = (cudaStream_t)0;
 
+static cudaEvent_t g_cluster_ev_pre  = (cudaEvent_t)0;
+static cudaEvent_t g_cluster_ev_post = (cudaEvent_t)0;
+
 /* Scoped override: route the thread-local dispatch stream to the graph
- * stream for the duration of a capture, then restore. Callers arrive in
- * a later commit (shared-expert FFN cluster capture); until then these
- * are intentionally unused. Pattern: set at BeginCapture, restore at
+ * stream for the duration of a capture, then restore. Used by the
+ * cluster capture machinery below: set at BeginCapture, restore at
  * EndCapture — never a persistent global override (see plan, punto B). */
-static cudaStream_t ds4_capture_scope_enter(void) DS4_CUDA_UNUSED;
 static cudaStream_t ds4_capture_scope_enter(void) {
     cudaStream_t prev = g_ds4_capture_stream;
     ds4_capture_set_stream(g_ds4_graph_stream);
     return prev;
 }
 
-static void ds4_capture_scope_exit(cudaStream_t prev) DS4_CUDA_UNUSED;
 static void ds4_capture_scope_exit(cudaStream_t prev) {
     ds4_capture_set_stream(prev);
 }
@@ -325,9 +325,178 @@ static void *cuda_tmp_alloc(uint64_t bytes, const char *what) {
     return g_cuda_tmp;
 }
 
-static uint64_t ds4_cuda_tmp_generation(void) DS4_CUDA_UNUSED;
 static uint64_t ds4_cuda_tmp_generation(void) {
     return g_cuda_tmp_generation;
+}
+
+/* Stage 1 (C3): shared-expert FFN cluster graphs, one slot per layer.
+ * The cluster is the fixed three-shim sequence gate_up_swiglu -> swiglu
+ * -> shared_down_hc_expand. All participating kernels take stable
+ * buffer pointers and no per-token scalars (see audit), so a captured
+ * graph stays valid as long as (a) the buffer pointers and weight
+ * offsets in the key match and (b) the tmp arena generation matches. */
+#define DS4_CLUSTER_GRAPH_MAX_LAYERS 64u
+
+typedef struct {
+    const void *x_ptr;
+    const void *gate_ptr;
+    const void *up_ptr;
+    const void *mid_ptr;
+    const void *out_ptr;
+    uint64_t    gate_offset;
+    uint64_t    up_offset;
+    uint64_t    down_offset;
+} ds4_cluster_graph_key;
+
+typedef enum {
+    DS4_CLUSTER_SLOT_EMPTY = 0,   /* never seen: run eager, remember key   */
+    DS4_CLUSTER_SLOT_WARMED,      /* seen once eager: next sighting captures */
+    DS4_CLUSTER_SLOT_CAPTURED     /* exec ready: replay                     */
+} ds4_cluster_slot_state;
+
+typedef struct {
+    ds4_cluster_graph_key  key;
+    ds4_cluster_slot_state state;
+    cudaGraphExec_t        exec;
+    uint64_t               tmp_generation;  /* arena gen at capture time */
+} ds4_cluster_graph_slot;
+
+static ds4_cluster_graph_slot g_cluster_graphs[DS4_CLUSTER_GRAPH_MAX_LAYERS];
+/* Thread-local capture bookkeeping for the currently open capture. */
+static thread_local int g_cluster_capture_il = -1;
+static thread_local cudaStream_t g_cluster_capture_prev_stream;
+
+/* Bidirectional sync brackets around every graph launch, both required
+ * (Entrpi b66b5d6): pre = the cluster input (x) produced on stream 0
+ * must be visible to the graph stream; post = the output produced by
+ * the graph must be visible to stream 0 before the next consumer.
+ * Single-threaded dispatch, one cluster in flight -> one reusable
+ * event per direction suffices. Any failure invalidates the slot and
+ * reports eager fallback: never leave a half-bracketed launch cached. */
+static int ds4_cluster_graph_launch(ds4_cluster_graph_slot *slot) {
+    if (!cuda_ok(cudaEventRecord(g_cluster_ev_pre, (cudaStream_t)0),
+                 "cluster pre bracket record") ||
+        !cuda_ok(cudaStreamWaitEvent(g_ds4_graph_stream, g_cluster_ev_pre, 0),
+                 "cluster pre bracket wait") ||
+        !cuda_ok(cudaGraphLaunch(slot->exec, g_ds4_graph_stream),
+                 "cluster graph launch") ||
+        !cuda_ok(cudaEventRecord(g_cluster_ev_post, g_ds4_graph_stream),
+                 "cluster post bracket record") ||
+        !cuda_ok(cudaStreamWaitEvent((cudaStream_t)0, g_cluster_ev_post, 0),
+                 "cluster post bracket wait")) {
+        (void)cudaGraphExecDestroy(slot->exec);
+        slot->exec = NULL;
+        slot->state = DS4_CLUSTER_SLOT_EMPTY;
+        return -1;
+    }
+    return 0;
+}
+
+/* Returns: 1 = replayed, work done, skip the three shims and call
+ * nothing else; 0 = capture opened, run the three shims then call
+ * ds4_cluster_graph_end(); -1 = eager, run the shims, no end() call.
+ *
+ * C4 wiring contract:
+ *   rc = begin(il, &key);
+ *   rc == 1  -> do not run the three shims (replay already launched
+ *               this token's work)
+ *   rc == 0  -> run the three shims, then rc2 = end();
+ *               rc2 == -1 -> re-run the three shims eagerly (rare: a
+ *               capture records without executing, so a failure leaves
+ *               the token without FFN work — the re-run is mandatory)
+ *   rc == -1 -> run the three shims (eager)
+ * The caller guarantees: n_tok == 1 (the prefill/MTP batch path never
+ * comes through here), the same shim sequence in all cases, and no
+ * other GPU call between begin and end. */
+static int ds4_cluster_graph_begin(uint32_t il,
+                                   const ds4_cluster_graph_key *key) DS4_CUDA_UNUSED;
+static int ds4_cluster_graph_begin(uint32_t il,
+                                   const ds4_cluster_graph_key *key) {
+    /* Capture and MoE profiling are mutually exclusive (plan, punto A):
+     * the profiling path does host-side event sync inline in the MoE
+     * body, which is invalid inside a captured region. */
+    static int s_moe_profile = -1;
+    if (s_moe_profile < 0) {
+        s_moe_profile = (getenv("DS4_CUDA_MOE_PROFILE") != NULL) ? 1 : 0;
+    }
+    if (!ds4_cuda_graphs_gate_enabled() ||
+        g_ds4_graph_stream == (cudaStream_t)0 ||
+        il >= DS4_CLUSTER_GRAPH_MAX_LAYERS ||
+        s_moe_profile) {
+        return -1;
+    }
+    ds4_cluster_graph_slot *slot = &g_cluster_graphs[il];
+    if (slot->state == DS4_CLUSTER_SLOT_CAPTURED &&
+        (memcmp(&slot->key, key, sizeof(*key)) != 0 ||
+         slot->tmp_generation != ds4_cuda_tmp_generation())) {
+        /* Arena grew or buffers moved: every pointer baked into the
+         * captured graph is suspect. Never replay unverified pointers. */
+        (void)cudaGraphExecDestroy(slot->exec);
+        slot->exec = NULL;
+        slot->state = DS4_CLUSTER_SLOT_EMPTY;
+    }
+    if (slot->state == DS4_CLUSTER_SLOT_CAPTURED) {
+        if (ds4_cluster_graph_launch(slot) != 0) return -1;
+        return 1;
+    }
+    if (slot->state == DS4_CLUSTER_SLOT_EMPTY) {
+        /* First sighting: run eager so the lazy allocators (arena,
+         * cuBLAS workspaces, lazy module loading) size themselves
+         * outside any captured region. */
+        slot->key = *key;
+        slot->state = DS4_CLUSTER_SLOT_WARMED;
+        return -1;
+    }
+    if (memcmp(&slot->key, key, sizeof(*key)) != 0) {
+        slot->key = *key;
+        return -1;
+    }
+    g_cluster_capture_prev_stream = ds4_capture_scope_enter();
+    if (!cuda_ok(cudaStreamBeginCapture(g_ds4_graph_stream,
+                                        cudaStreamCaptureModeGlobal),
+                 "cluster begin capture")) {
+        ds4_capture_scope_exit(g_cluster_capture_prev_stream);
+        slot->state = DS4_CLUSTER_SLOT_EMPTY;
+        return -1;
+    }
+    g_cluster_capture_il = (int)il;
+    return 0;
+}
+
+/* Call ONLY after begin() returned 0 and the three shims ran.
+ * Returns 0 = graph committed AND this token's work launched;
+ * -1 = capture failed, slot invalidated, CALLER MUST RE-RUN the three
+ * shims eagerly (the captured work was recorded, never executed). */
+static int ds4_cluster_graph_end(void) DS4_CUDA_UNUSED;
+static int ds4_cluster_graph_end(void) {
+    if (g_cluster_capture_il < 0) return -1;
+    ds4_cluster_graph_slot *slot = &g_cluster_graphs[g_cluster_capture_il];
+    cudaGraph_t graph = NULL;
+    int end_ok = cuda_ok(cudaStreamEndCapture(g_ds4_graph_stream, &graph),
+                         "cluster end capture");
+    /* Restore the dispatch stream unconditionally: the scoped override
+     * must never outlive the capture, success or failure. */
+    ds4_capture_scope_exit(g_cluster_capture_prev_stream);
+    g_cluster_capture_il = -1;
+    if (!end_ok) {
+        slot->state = DS4_CLUSTER_SLOT_EMPTY;
+        return -1;
+    }
+    cudaGraphExec_t exec = NULL;
+    if (!cuda_ok(cudaGraphInstantiate(&exec, graph, 0),
+                 "cluster graph instantiate")) {
+        (void)cudaGraphDestroy(graph);
+        slot->state = DS4_CLUSTER_SLOT_EMPTY;
+        return -1;
+    }
+    (void)cudaGraphDestroy(graph);
+    slot->exec = exec;
+    slot->tmp_generation = ds4_cuda_tmp_generation();
+    slot->state = DS4_CLUSTER_SLOT_CAPTURED;
+    /* The capture recorded this token's work without executing it:
+     * launch it now, with the same brackets as a replay. */
+    if (ds4_cluster_graph_launch(slot) != 0) return -1;
+    return 0;
 }
 
 static int cuda_attention_score_buffer_fits(uint32_t n_comp) {
@@ -2335,6 +2504,18 @@ extern "C" int ds4_gpu_init(void) {
              * must never fail backend init. Fall back to eager. */
             g_ds4_graph_stream = (cudaStream_t)0;
         }
+        if (g_ds4_graph_stream != (cudaStream_t)0) {
+            if (!cuda_ok(cudaEventCreateWithFlags(&g_cluster_ev_pre,
+                                                  cudaEventDisableTiming),
+                         "create cluster pre event") ||
+                !cuda_ok(cudaEventCreateWithFlags(&g_cluster_ev_post,
+                                                  cudaEventDisableTiming),
+                         "create cluster post event")) {
+                /* No events -> no brackets -> no graphs. Eager fallback. */
+                (void)cudaStreamDestroy(g_ds4_graph_stream);
+                g_ds4_graph_stream = (cudaStream_t)0;
+            }
+        }
     }
     return 1;
 }
@@ -2344,6 +2525,21 @@ extern "C" void ds4_gpu_cleanup(void) {
     if (g_ds4_graph_stream != (cudaStream_t)0) {
         (void)cudaStreamDestroy(g_ds4_graph_stream);
         g_ds4_graph_stream = (cudaStream_t)0;
+    }
+    if (g_cluster_ev_pre != (cudaEvent_t)0) {
+        (void)cudaEventDestroy(g_cluster_ev_pre);
+        g_cluster_ev_pre = (cudaEvent_t)0;
+    }
+    if (g_cluster_ev_post != (cudaEvent_t)0) {
+        (void)cudaEventDestroy(g_cluster_ev_post);
+        g_cluster_ev_post = (cudaEvent_t)0;
+    }
+    for (uint32_t i = 0; i < DS4_CLUSTER_GRAPH_MAX_LAYERS; i++) {
+        if (g_cluster_graphs[i].state == DS4_CLUSTER_SLOT_CAPTURED) {
+            (void)cudaGraphExecDestroy(g_cluster_graphs[i].exec);
+        }
+        g_cluster_graphs[i].exec = NULL;
+        g_cluster_graphs[i].state = DS4_CLUSTER_SLOT_EMPTY;
     }
     if (g_cublas_ready) {
         (void)cublasDestroy(g_cublas);
