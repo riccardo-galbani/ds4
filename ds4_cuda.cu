@@ -211,6 +211,13 @@ static int g_model_load_progress_started;
 static int g_model_load_progress_tty;
 static void *g_cuda_tmp;
 static uint64_t g_cuda_tmp_bytes;
+/* Stage 1 (C2): arena generation counter. Incremented on every
+ * grow (free+realloc) of the shared tmp arena. Graph capture code
+ * (later commit) records the generation at capture time and
+ * invalidates cached graphs on mismatch: a grown arena means every
+ * pointer previously handed out is dead, and a captured graph that
+ * baked one would silently replay on freed memory. */
+static uint64_t g_cuda_tmp_generation = 0;
 static void *g_model_stage_raw[4];
 static void *g_model_stage[4];
 static cudaEvent_t g_model_stage_event[4];
@@ -299,6 +306,7 @@ __global__ static void dequant_q8_0_to_f32_kernel(
 static void *cuda_tmp_alloc(uint64_t bytes, const char *what) {
     if (bytes == 0) return NULL;
     if (g_cuda_tmp_bytes >= bytes) return g_cuda_tmp;
+    g_cuda_tmp_generation++;
     if (g_cuda_tmp) {
         (void)cudaFree(g_cuda_tmp);
         g_cuda_tmp = NULL;
@@ -315,6 +323,11 @@ static void *cuda_tmp_alloc(uint64_t bytes, const char *what) {
     g_cuda_tmp = ptr;
     g_cuda_tmp_bytes = bytes;
     return g_cuda_tmp;
+}
+
+static uint64_t ds4_cuda_tmp_generation(void) DS4_CUDA_UNUSED;
+static uint64_t ds4_cuda_tmp_generation(void) {
+    return g_cuda_tmp_generation;
 }
 
 static int cuda_attention_score_buffer_fits(uint32_t n_comp) {
