@@ -237,9 +237,33 @@ static cudaStream_t ds4_current_stream(void) {
     return g_ds4_capture_stream;
 }
 
-static void ds4_capture_set_stream(cudaStream_t stream) DS4_CUDA_UNUSED;
 static void ds4_capture_set_stream(cudaStream_t stream) {
     g_ds4_capture_stream = stream;
+}
+
+/* Stage 1 (C1): process-global capture stream. Created NonBlocking in
+ * ds4_gpu_init when DS4_CUDA_GRAPHS is enabled; destroyed in cleanup.
+ * NonBlocking is required: while a capture is active, any use of the
+ * legacy stream is invalid if other streams in the context are blocking
+ * (CUDA Programming Guide 13.3, "Prohibited and Unhandled Operations").
+ * The three pre-existing helper streams are already NonBlocking. */
+static cudaStream_t g_ds4_graph_stream = (cudaStream_t)0;
+
+/* Scoped override: route the thread-local dispatch stream to the graph
+ * stream for the duration of a capture, then restore. Callers arrive in
+ * a later commit (shared-expert FFN cluster capture); until then these
+ * are intentionally unused. Pattern: set at BeginCapture, restore at
+ * EndCapture — never a persistent global override (see plan, punto B). */
+static cudaStream_t ds4_capture_scope_enter(void) DS4_CUDA_UNUSED;
+static cudaStream_t ds4_capture_scope_enter(void) {
+    cudaStream_t prev = g_ds4_capture_stream;
+    ds4_capture_set_stream(g_ds4_graph_stream);
+    return prev;
+}
+
+static void ds4_capture_scope_exit(cudaStream_t prev) DS4_CUDA_UNUSED;
+static void ds4_capture_scope_exit(cudaStream_t prev) {
+    ds4_capture_set_stream(prev);
 }
 
 static int cuda_ok(cudaError_t err, const char *what);
@@ -2290,11 +2314,24 @@ extern "C" int ds4_gpu_init(void) {
         (void)cublasSetMathMode(g_cublas, math_mode);
         g_cublas_ready = 1;
     }
+    if (ds4_cuda_graphs_gate_enabled() && g_ds4_graph_stream == (cudaStream_t)0) {
+        if (!cuda_ok(cudaStreamCreateWithFlags(&g_ds4_graph_stream,
+                                               cudaStreamNonBlocking),
+                     "create graph capture stream")) {
+            /* Graphs are an optimization: failure to create the stream
+             * must never fail backend init. Fall back to eager. */
+            g_ds4_graph_stream = (cudaStream_t)0;
+        }
+    }
     return 1;
 }
 
 extern "C" void ds4_gpu_cleanup(void) {
     (void)cudaDeviceSynchronize();
+    if (g_ds4_graph_stream != (cudaStream_t)0) {
+        (void)cudaStreamDestroy(g_ds4_graph_stream);
+        g_ds4_graph_stream = (cudaStream_t)0;
+    }
     if (g_cublas_ready) {
         (void)cublasDestroy(g_cublas);
         g_cublas_ready = 0;
