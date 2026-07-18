@@ -15983,7 +15983,16 @@ static bool metal_graph_encode_decode_layer(
     if (ok) {
         metal_graph_debug_dump_tensor("ffn_moe_out", g->routed_out, DS4_N_EMBD, il, pos);
     }
-    if (ok && fuse_shared_gate_up) {
+    int cluster_rc = -1;
+    if (ok && fuse_shared_gate_up && fuse_shared_down_hc && !decode_stage_profile) {
+        cluster_rc = ds4_gpu_cluster_ffn_begin(il, g->ffn_norm, g->shared_gate,
+                                               g->shared_up, g->shared_mid,
+                                               g->after_ffn_hc,
+                                               layer->ffn_gate_shexp->abs_offset,
+                                               layer->ffn_up_shexp->abs_offset,
+                                               layer->ffn_down_shexp->abs_offset);
+    }
+    if (ok && cluster_rc != 1 && fuse_shared_gate_up) {
         ok = ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(g->shared_gate,
                                                          g->shared_up,
                                                          g->shared_mid,
@@ -15995,7 +16004,7 @@ static bool metal_graph_encode_decode_layer(
                                                          shared_dim,
                                                          g->ffn_norm,
                                                          DS4_SWIGLU_CLAMP_EXP) != 0;
-    } else {
+    } else if (ok && cluster_rc != 1) {
         if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->shared_gate, model->map, model->size,
                                                   layer->ffn_gate_shexp->abs_offset,
                                                   DS4_N_EMBD, shared_dim,
@@ -16008,7 +16017,7 @@ static bool metal_graph_encode_decode_layer(
                                            shared_dim, DS4_SWIGLU_CLAMP_EXP, 1.0f) != 0;
     }
     DS4_METAL_PROFILE_DECODE_STAGE("shared_gate_up");
-    if (ok && fuse_shared_down_hc) {
+    if (ok && cluster_rc != 1 && fuse_shared_down_hc) {
         ok = ds4_gpu_shared_down_hc_expand_q8_0_tensor(g->after_ffn_hc,
                                                          g->shared_out,
                                                          model->map,
@@ -16022,13 +16031,45 @@ static bool metal_graph_encode_decode_layer(
                                                          g->hc_split,
                                                          DS4_N_EMBD,
                                                          DS4_N_HC) != 0;
-    } else if (ok) {
+    } else if (ok && cluster_rc != 1) {
         ok = ds4_gpu_matmul_q8_0_tensor(g->shared_out, model->map, model->size,
                                           layer->ffn_down_shexp->abs_offset,
                                           shared_dim, DS4_N_EMBD,
                                           g->shared_mid, 1) != 0;
     }
     DS4_METAL_PROFILE_DECODE_STAGE("shared_down");
+    if (ok && cluster_rc == 0) {
+        if (ds4_gpu_cluster_ffn_end() != 0) {
+            /* Capture recorded the two shims without executing them:
+             * the token has no FFN work yet. Mandatory eager re-run,
+             * identical calls to the two above. Rare path (launch
+             * failure after a successful capture). */
+            ok = ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(g->shared_gate,
+                                                             g->shared_up,
+                                                             g->shared_mid,
+                                                             model->map,
+                                                             model->size,
+                                                             layer->ffn_gate_shexp->abs_offset,
+                                                             layer->ffn_up_shexp->abs_offset,
+                                                             DS4_N_EMBD,
+                                                             shared_dim,
+                                                             g->ffn_norm,
+                                                             DS4_SWIGLU_CLAMP_EXP) != 0;
+            if (ok) ok = ds4_gpu_shared_down_hc_expand_q8_0_tensor(g->after_ffn_hc,
+                                                                    g->shared_out,
+                                                                    model->map,
+                                                                    model->size,
+                                                                    layer->ffn_down_shexp->abs_offset,
+                                                                    shared_dim,
+                                                                    DS4_N_EMBD,
+                                                                    g->shared_mid,
+                                                                    g->routed_out,
+                                                                    g->after_attn_hc,
+                                                                    g->hc_split,
+                                                                    DS4_N_EMBD,
+                                                                    DS4_N_HC) != 0;
+        }
+    }
     if (ok) {
         metal_graph_debug_dump_tensor("ffn_shexp", g->shared_out, DS4_N_EMBD, il, pos);
     }

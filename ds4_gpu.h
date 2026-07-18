@@ -1003,6 +1003,33 @@ int ds4_gpu_shared_down_hc_expand_q8_0_tensor(
         uint32_t                n_embd,
         uint32_t                n_hc);
 
+/* Stage 1 (C4): shared-expert FFN cluster capture entry points. Wraps the
+ * fixed two-shim fused sequence shared_gate_up_swiglu_q8_0 ->
+ * shared_down_hc_expand_q8_0 for a single decode-layer FFN (n_tok == 1,
+ * fully-resident weights only — the caller must gate on
+ * fuse_shared_gate_up && fuse_shared_down_hc && !decode_stage_profile).
+ *
+ * Returns: 1 = replayed, the caller must run NEITHER shim; 0 = capture
+ * opened, the caller must run BOTH shims then call
+ * ds4_gpu_cluster_ffn_end(); -1 = eager, the caller must run BOTH shims,
+ * no end() call. Full state machine: ds4_cluster_graph_begin() in
+ * ds4_cuda.cu. */
+int ds4_gpu_cluster_ffn_begin(
+        uint32_t                il,
+        const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *gate,
+        const ds4_gpu_tensor *up,
+        const ds4_gpu_tensor *mid,
+        const ds4_gpu_tensor *out_hc,
+        uint64_t                gate_offset,
+        uint64_t                up_offset,
+        uint64_t                down_offset);
+
+/* Call ONLY after begin() returned 0 and BOTH shims ran. Returns 0 = graph
+ * committed and this token's work launched; -1 = capture failed, CALLER
+ * MUST RE-RUN both shims eagerly (the recorded work was never executed). */
+int ds4_gpu_cluster_ffn_end(void);
+
 int ds4_gpu_matmul_q8_0_hc_expand_tensor(
         ds4_gpu_tensor       *out_hc,
         ds4_gpu_tensor       *block_out,

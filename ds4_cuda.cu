@@ -329,13 +329,21 @@ static uint64_t ds4_cuda_tmp_generation(void) {
     return g_cuda_tmp_generation;
 }
 
-/* Stage 1 (C3): shared-expert FFN cluster graphs, one slot per layer.
- * The cluster is the fixed three-shim sequence gate_up_swiglu -> swiglu
- * -> shared_down_hc_expand. All participating kernels take stable
+/* Stage 1 (C3): shared-expert FFN cluster graphs, set-associative with
+ * DS4_CLUSTER_GRAPH_WAYS ways per layer. A single slot per layer is not
+ * enough: the decode loop swaps g->cur_hc / g->after_ffn_hc after every
+ * layer, and with an odd layer count (43) the FFN output pointer seen
+ * by a given il alternates between the two buffers with token parity;
+ * the MTP head adds a third key on il=1 (its own tensors and offsets).
+ * The cluster is the fixed two-shim fused sequence
+ * shared_gate_up_swiglu (gate+up+swiglu internally) ->
+ * shared_down_hc_expand. All participating kernels take stable
  * buffer pointers and no per-token scalars (see audit), so a captured
  * graph stays valid as long as (a) the buffer pointers and weight
- * offsets in the key match and (b) the tmp arena generation matches. */
+ * offsets in the key match one way and (b) the tmp arena generation
+ * matches. */
 #define DS4_CLUSTER_GRAPH_MAX_LAYERS 64u
+#define DS4_CLUSTER_GRAPH_WAYS 4u
 
 typedef struct {
     const void *x_ptr;
@@ -361,9 +369,17 @@ typedef struct {
     uint64_t               tmp_generation;  /* arena gen at capture time */
 } ds4_cluster_graph_slot;
 
-static ds4_cluster_graph_slot g_cluster_graphs[DS4_CLUSTER_GRAPH_MAX_LAYERS];
+static ds4_cluster_graph_slot
+        g_cluster_graphs[DS4_CLUSTER_GRAPH_MAX_LAYERS][DS4_CLUSTER_GRAPH_WAYS];
+/* Stage 1 (C4): counters for the benchmark protocol (plan, Criteri di
+ * test). Incremented in the begin/end state machine, printed once at
+ * cleanup when graphs are enabled. */
+static uint64_t g_cluster_stat_replay  = 0;  /* rc == 1 from begin()      */
+static uint64_t g_cluster_stat_capture = 0;  /* end() reached state CAPTURED */
+static uint64_t g_cluster_stat_eager   = 0;  /* rc == -1, any reason      */
 /* Thread-local capture bookkeeping for the currently open capture. */
 static thread_local int g_cluster_capture_il = -1;
+static thread_local int g_cluster_capture_way = -1;
 static thread_local cudaStream_t g_cluster_capture_prev_stream;
 
 /* Bidirectional sync brackets around every graph launch, both required
@@ -392,24 +408,24 @@ static int ds4_cluster_graph_launch(ds4_cluster_graph_slot *slot) {
     return 0;
 }
 
-/* Returns: 1 = replayed, work done, skip the three shims and call
- * nothing else; 0 = capture opened, run the three shims then call
+/* Returns: 1 = replayed, work done, skip the two shims and call
+ * nothing else; 0 = capture opened, run the two shims then call
  * ds4_cluster_graph_end(); -1 = eager, run the shims, no end() call.
  *
  * C4 wiring contract:
  *   rc = begin(il, &key);
- *   rc == 1  -> do not run the three shims (replay already launched
+ *   rc == 1  -> do not run the two shims (replay already launched
  *               this token's work)
- *   rc == 0  -> run the three shims, then rc2 = end();
- *               rc2 == -1 -> re-run the three shims eagerly (rare: a
+ *   rc == 0  -> run the two shims, then rc2 = end();
+ *               rc2 == -1 -> re-run the two shims eagerly (rare: a
  *               capture records without executing, so a failure leaves
  *               the token without FFN work — the re-run is mandatory)
- *   rc == -1 -> run the three shims (eager)
+ *   rc == -1 -> run the two shims (eager)
  * The caller guarantees: n_tok == 1 (the prefill/MTP batch path never
  * comes through here), the same shim sequence in all cases, and no
  * other GPU call between begin and end. */
 static int ds4_cluster_graph_begin(uint32_t il,
-                                   const ds4_cluster_graph_key *key) DS4_CUDA_UNUSED;
+                                   const ds4_cluster_graph_key *key);
 static int ds4_cluster_graph_begin(uint32_t il,
                                    const ds4_cluster_graph_key *key) {
     /* Capture and MoE profiling are mutually exclusive (plan, punto A):
@@ -423,54 +439,90 @@ static int ds4_cluster_graph_begin(uint32_t il,
         g_ds4_graph_stream == (cudaStream_t)0 ||
         il >= DS4_CLUSTER_GRAPH_MAX_LAYERS ||
         s_moe_profile) {
+        g_cluster_stat_eager++;
         return -1;
     }
-    ds4_cluster_graph_slot *slot = &g_cluster_graphs[il];
-    if (slot->state == DS4_CLUSTER_SLOT_CAPTURED &&
-        (memcmp(&slot->key, key, sizeof(*key)) != 0 ||
-         slot->tmp_generation != ds4_cuda_tmp_generation())) {
-        /* Arena grew or buffers moved: every pointer baked into the
-         * captured graph is suspect. Never replay unverified pointers. */
-        (void)cudaGraphExecDestroy(slot->exec);
-        slot->exec = NULL;
-        slot->state = DS4_CLUSTER_SLOT_EMPTY;
+    ds4_cluster_graph_slot *ways = g_cluster_graphs[il];
+    /* Arena grew: every pointer baked into any captured graph of this
+     * layer is suspect. Never replay unverified pointers. A key
+     * mismatch, by contrast, no longer invalidates anything: with ways
+     * it only means "not this way". */
+    for (uint32_t w = 0; w < DS4_CLUSTER_GRAPH_WAYS; w++) {
+        if (ways[w].state == DS4_CLUSTER_SLOT_CAPTURED &&
+            ways[w].tmp_generation != ds4_cuda_tmp_generation()) {
+            (void)cudaGraphExecDestroy(ways[w].exec);
+            ways[w].exec = NULL;
+            ways[w].state = DS4_CLUSTER_SLOT_EMPTY;
+        }
     }
-    if (slot->state == DS4_CLUSTER_SLOT_CAPTURED) {
-        if (ds4_cluster_graph_launch(slot) != 0) return -1;
-        return 1;
+    for (uint32_t w = 0; w < DS4_CLUSTER_GRAPH_WAYS; w++) {
+        if (ways[w].state == DS4_CLUSTER_SLOT_CAPTURED &&
+            memcmp(&ways[w].key, key, sizeof(*key)) == 0) {
+            if (ds4_cluster_graph_launch(&ways[w]) != 0) {
+                g_cluster_stat_eager++;
+                return -1;
+            }
+            g_cluster_stat_replay++;
+            return 1;
+        }
     }
-    if (slot->state == DS4_CLUSTER_SLOT_EMPTY) {
-        /* First sighting: run eager so the lazy allocators (arena,
-         * cuBLAS workspaces, lazy module loading) size themselves
-         * outside any captured region. */
-        slot->key = *key;
-        slot->state = DS4_CLUSTER_SLOT_WARMED;
-        return -1;
+    for (uint32_t w = 0; w < DS4_CLUSTER_GRAPH_WAYS; w++) {
+        if (ways[w].state == DS4_CLUSTER_SLOT_WARMED &&
+            memcmp(&ways[w].key, key, sizeof(*key)) == 0) {
+            g_cluster_capture_prev_stream = ds4_capture_scope_enter();
+            if (!cuda_ok(cudaStreamBeginCapture(g_ds4_graph_stream,
+                                                cudaStreamCaptureModeGlobal),
+                         "cluster begin capture")) {
+                ds4_capture_scope_exit(g_cluster_capture_prev_stream);
+                ways[w].state = DS4_CLUSTER_SLOT_EMPTY;
+                g_cluster_stat_eager++;
+                return -1;
+            }
+            g_cluster_capture_il = (int)il;
+            g_cluster_capture_way = (int)w;
+            return 0;
+        }
     }
-    if (memcmp(&slot->key, key, sizeof(*key)) != 0) {
-        slot->key = *key;
-        return -1;
+    /* No way holds this key: pick one for warm-up. Deterministic policy,
+     * no LRU: the hc carousel alternates with fixed parity, two tokens
+     * per layer fill the useful ways. Prefer an EMPTY way; otherwise
+     * replace a WARMED one (its key lost the race to capture). NEVER
+     * evict a valid CAPTURED way. */
+    for (uint32_t w = 0; w < DS4_CLUSTER_GRAPH_WAYS; w++) {
+        if (ways[w].state == DS4_CLUSTER_SLOT_EMPTY) {
+            /* First sighting: run eager so the lazy allocators (arena,
+             * cuBLAS workspaces, lazy module loading) size themselves
+             * outside any captured region. */
+            ways[w].key = *key;
+            ways[w].state = DS4_CLUSTER_SLOT_WARMED;
+            g_cluster_stat_eager++;
+            return -1;
+        }
     }
-    g_cluster_capture_prev_stream = ds4_capture_scope_enter();
-    if (!cuda_ok(cudaStreamBeginCapture(g_ds4_graph_stream,
-                                        cudaStreamCaptureModeGlobal),
-                 "cluster begin capture")) {
-        ds4_capture_scope_exit(g_cluster_capture_prev_stream);
-        slot->state = DS4_CLUSTER_SLOT_EMPTY;
-        return -1;
+    for (uint32_t w = 0; w < DS4_CLUSTER_GRAPH_WAYS; w++) {
+        if (ways[w].state == DS4_CLUSTER_SLOT_WARMED) {
+            ways[w].key = *key;
+            g_cluster_stat_eager++;
+            return -1;
+        }
     }
-    g_cluster_capture_il = (int)il;
-    return 0;
+    /* All ways CAPTURED and valid, none matches: eager, touch nothing. */
+    g_cluster_stat_eager++;
+    return -1;
 }
 
-/* Call ONLY after begin() returned 0 and the three shims ran.
+/* Call ONLY after begin() returned 0 and the two shims ran.
  * Returns 0 = graph committed AND this token's work launched;
- * -1 = capture failed, slot invalidated, CALLER MUST RE-RUN the three
+ * -1 = capture failed, slot invalidated, CALLER MUST RE-RUN the two
  * shims eagerly (the captured work was recorded, never executed). */
-static int ds4_cluster_graph_end(void) DS4_CUDA_UNUSED;
+static int ds4_cluster_graph_end(void);
 static int ds4_cluster_graph_end(void) {
-    if (g_cluster_capture_il < 0) return -1;
-    ds4_cluster_graph_slot *slot = &g_cluster_graphs[g_cluster_capture_il];
+    if (g_cluster_capture_il < 0 || g_cluster_capture_way < 0) {
+        g_cluster_stat_eager++;
+        return -1;
+    }
+    ds4_cluster_graph_slot *slot =
+            &g_cluster_graphs[g_cluster_capture_il][g_cluster_capture_way];
     cudaGraph_t graph = NULL;
     int end_ok = cuda_ok(cudaStreamEndCapture(g_ds4_graph_stream, &graph),
                          "cluster end capture");
@@ -478,8 +530,10 @@ static int ds4_cluster_graph_end(void) {
      * must never outlive the capture, success or failure. */
     ds4_capture_scope_exit(g_cluster_capture_prev_stream);
     g_cluster_capture_il = -1;
+    g_cluster_capture_way = -1;
     if (!end_ok) {
         slot->state = DS4_CLUSTER_SLOT_EMPTY;
+        g_cluster_stat_eager++;
         return -1;
     }
     cudaGraphExec_t exec = NULL;
@@ -487,6 +541,7 @@ static int ds4_cluster_graph_end(void) {
                  "cluster graph instantiate")) {
         (void)cudaGraphDestroy(graph);
         slot->state = DS4_CLUSTER_SLOT_EMPTY;
+        g_cluster_stat_eager++;
         return -1;
     }
     (void)cudaGraphDestroy(graph);
@@ -495,8 +550,37 @@ static int ds4_cluster_graph_end(void) {
     slot->state = DS4_CLUSTER_SLOT_CAPTURED;
     /* The capture recorded this token's work without executing it:
      * launch it now, with the same brackets as a replay. */
-    if (ds4_cluster_graph_launch(slot) != 0) return -1;
+    if (ds4_cluster_graph_launch(slot) != 0) {
+        g_cluster_stat_eager++;
+        return -1;
+    }
+    g_cluster_stat_capture++;
     return 0;
+}
+
+/* Stage 1 (C4): thin extern "C" wrappers exposing the cluster state
+ * machine to ds4.c. ds4_gpu_tensor is opaque there (defined only in this
+ * file), so the ->ptr extraction happens here, not at the call site. */
+extern "C" int ds4_gpu_cluster_ffn_begin(
+        uint32_t il,
+        const ds4_gpu_tensor *x, const ds4_gpu_tensor *gate,
+        const ds4_gpu_tensor *up, const ds4_gpu_tensor *mid,
+        const ds4_gpu_tensor *out_hc,
+        uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset) {
+    ds4_cluster_graph_key key;
+    key.x_ptr = x->ptr;
+    key.gate_ptr = gate->ptr;
+    key.up_ptr = up->ptr;
+    key.mid_ptr = mid->ptr;
+    key.out_ptr = out_hc->ptr;
+    key.gate_offset = gate_offset;
+    key.up_offset = up_offset;
+    key.down_offset = down_offset;
+    return ds4_cluster_graph_begin(il, &key);
+}
+
+extern "C" int ds4_gpu_cluster_ffn_end(void) {
+    return ds4_cluster_graph_end();
 }
 
 static int cuda_attention_score_buffer_fits(uint32_t n_comp) {
@@ -2534,12 +2618,21 @@ extern "C" void ds4_gpu_cleanup(void) {
         (void)cudaEventDestroy(g_cluster_ev_post);
         g_cluster_ev_post = (cudaEvent_t)0;
     }
+    if (ds4_cuda_graphs_gate_enabled()) {
+        fprintf(stderr,
+                "ds4: cuda cluster graphs: %llu replayed, %llu captured, %llu eager\n",
+                (unsigned long long)g_cluster_stat_replay,
+                (unsigned long long)g_cluster_stat_capture,
+                (unsigned long long)g_cluster_stat_eager);
+    }
     for (uint32_t i = 0; i < DS4_CLUSTER_GRAPH_MAX_LAYERS; i++) {
-        if (g_cluster_graphs[i].state == DS4_CLUSTER_SLOT_CAPTURED) {
-            (void)cudaGraphExecDestroy(g_cluster_graphs[i].exec);
+        for (uint32_t w = 0; w < DS4_CLUSTER_GRAPH_WAYS; w++) {
+            if (g_cluster_graphs[i][w].state == DS4_CLUSTER_SLOT_CAPTURED) {
+                (void)cudaGraphExecDestroy(g_cluster_graphs[i][w].exec);
+            }
+            g_cluster_graphs[i][w].exec = NULL;
+            g_cluster_graphs[i][w].state = DS4_CLUSTER_SLOT_EMPTY;
         }
-        g_cluster_graphs[i].exec = NULL;
-        g_cluster_graphs[i].state = DS4_CLUSTER_SLOT_EMPTY;
     }
     if (g_cublas_ready) {
         (void)cublasDestroy(g_cublas);
