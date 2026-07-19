@@ -218,6 +218,13 @@ static uint64_t g_cuda_tmp_bytes;
  * pointer previously handed out is dead, and a captured graph that
  * baked one would silently replay on freed memory. */
 static uint64_t g_cuda_tmp_generation = 0;
+/* Stage 1 (C5): set once the arena has been pre-warmed to the computed
+ * session maximum. Any grow after this point means a sizing formula in
+ * the caller is wrong: correctness is still preserved (the generation
+ * bump invalidates captured graphs, C3), but the mass re-capture it
+ * causes defeats the point of pre-warming, so we warn once. */
+static bool g_cuda_tmp_prewarmed = false;
+static bool g_cuda_tmp_grow_warned = false;
 static void *g_model_stage_raw[4];
 static void *g_model_stage[4];
 static cudaEvent_t g_model_stage_event[4];
@@ -307,6 +314,15 @@ static void *cuda_tmp_alloc(uint64_t bytes, const char *what) {
     if (bytes == 0) return NULL;
     if (g_cuda_tmp_bytes >= bytes) return g_cuda_tmp;
     g_cuda_tmp_generation++;
+    if (g_cuda_tmp_prewarmed && !g_cuda_tmp_grow_warned) {
+        fprintf(stderr,
+            "ds4-cuda-graphs: WARNING: tmp arena grew after pre-warm "
+            "(%zu -> %zu bytes, generation %llu): a pre-warm sizing bound "
+            "is wrong; captured graphs were invalidated.\n",
+            (size_t)g_cuda_tmp_bytes, (size_t)bytes,
+            (unsigned long long)g_cuda_tmp_generation);
+        g_cuda_tmp_grow_warned = true;
+    }
     if (g_cuda_tmp) {
         (void)cudaFree(g_cuda_tmp);
         g_cuda_tmp = NULL;
@@ -327,6 +343,28 @@ static void *cuda_tmp_alloc(uint64_t bytes, const char *what) {
 
 static uint64_t ds4_cuda_tmp_generation(void) {
     return g_cuda_tmp_generation;
+}
+
+/* Stage 1 (C5): pre-warm the shared tmp arena to the session maximum
+ * computed by the caller (ds4.c, which owns the session bounds). Goes
+ * through cuda_tmp_alloc so the grow uses the existing, tested path and
+ * bumps the generation exactly once, before anything is captured. If the
+ * grow fails (or falls short) we warn and continue in lazy mode: the
+ * generation counter (C2/C3) still guarantees correctness. */
+extern "C" void ds4_cuda_tmp_prewarm(size_t bytes) {
+    if (!ds4_cuda_graphs_gate_enabled()) return;
+    if (bytes == 0) return;
+    void *ptr = cuda_tmp_alloc((uint64_t)bytes, "graphs pre-warm");
+    if (!ptr || g_cuda_tmp_bytes < (uint64_t)bytes) {
+        fprintf(stderr,
+            "ds4-cuda-graphs: WARNING: tmp arena pre-warm to %zu bytes "
+            "failed; continuing with lazy growth.\n", bytes);
+        return;
+    }
+    g_cuda_tmp_prewarmed = true;
+    fprintf(stderr,
+        "ds4-cuda-graphs: tmp arena pre-warmed to %zu bytes (generation %llu)\n",
+        bytes, (unsigned long long)g_cuda_tmp_generation);
 }
 
 /* Stage 1 (C3): shared-expert FFN cluster graphs, set-associative with
@@ -2620,10 +2658,11 @@ extern "C" void ds4_gpu_cleanup(void) {
     }
     if (ds4_cuda_graphs_gate_enabled()) {
         fprintf(stderr,
-                "ds4: cuda cluster graphs: %llu replayed, %llu captured, %llu eager\n",
+                "ds4: cuda cluster graphs: %llu replayed, %llu captured, %llu eager, arena generation %llu\n",
                 (unsigned long long)g_cluster_stat_replay,
                 (unsigned long long)g_cluster_stat_capture,
-                (unsigned long long)g_cluster_stat_eager);
+                (unsigned long long)g_cluster_stat_eager,
+                (unsigned long long)g_cuda_tmp_generation);
     }
     for (uint32_t i = 0; i < DS4_CLUSTER_GRAPH_MAX_LAYERS; i++) {
         for (uint32_t w = 0; w < DS4_CLUSTER_GRAPH_WAYS; w++) {

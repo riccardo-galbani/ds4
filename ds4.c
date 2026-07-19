@@ -22958,6 +22958,29 @@ static int generate_raw_swa_cpu(
 /* Metal generation entry point.  The model runs as one local whole-graph
  * pipeline: graph prefill followed by graph decode steps.  Streaming PRO may
  * use decode-style prefill for short prompts. */
+/* Stage 1 (C5): defined next to ds4_session_create below; declared here
+ * because the sessionless greedy path also owns a graph creation point. */
+static uint64_t cuda_tmp_session_max_bytes(bool quality,
+                                           bool mtp_ready,
+                                           int mtp_draft_tokens,
+                                           const ds4_gpu_graph *g,
+                                           const ds4_layer_weights *shape_layer,
+                                           uint32_t prefill_cap);
+
+/* Stage 1 (C5): implemented in ds4_cuda.cu — pre-warms the shared tmp
+ * arena to the computed session maximum (no-op when the gate is off). */
+extern void ds4_cuda_tmp_prewarm(size_t bytes);
+
+/* Stage 1 (C5): CUDA graphs gate, same semantics as C1 in ds4_cuda.cu
+ * (DS4_CUDA_GRAPHS value, not presence). Gating the call sites here too
+ * keeps the gate-off path free of new work: the session maximum is never
+ * even computed. The second gate inside ds4_cuda_tmp_prewarm is
+ * deliberate, not redundant to remove. */
+static bool ds4_cuda_graphs_enabled(void) {
+    const char *v = getenv("DS4_CUDA_GRAPHS");
+    return v && v[0] != '\0' && strcmp(v, "0") != 0;
+}
+
 static int generate_metal_graph_raw_swa(
         const ds4_model   * model,
         const ds4_vocab   * vocab,
@@ -23013,6 +23036,20 @@ static int generate_metal_graph_raw_swa(
                                                directional_steering_ffn)) {
         metal_graph_free(&g);
         return 1;
+    }
+    /* Stage 1 (C5): sessionless twin of the ds4_session_create pre-warm
+     * (the greedy non-MTP CLI path builds its graph here, bypassing
+     * sessions). All bounds are known and the first forward has not run
+     * yet; this path never initializes the MTP draft, hence mtp off.
+     * prefill_cap here is prompt-based by this path's own definition:
+     * the graph lives for one generation, so that IS its session bound. */
+    if (ds4_cuda_graphs_enabled()) {
+        ds4_cuda_tmp_prewarm((size_t)cuda_tmp_session_max_bytes(quality,
+                                                                false,
+                                                                0,
+                                                                &g,
+                                                                &weights->layer[0],
+                                                                prefill_cap));
     }
     const bool memory_report = getenv("DS4_METAL_MEMORY_REPORT") != NULL;
     if (memory_report) ds4_gpu_print_memory_report("after graph alloc");
@@ -26077,6 +26114,255 @@ void ds4_engine_close(ds4_engine *e) {
     free(e);
 }
 
+#ifndef DS4_NO_GPU
+static uint64_t cuda_tmp_bytes_max(uint64_t a, uint64_t b) {
+    return a > b ? a : b;
+}
+
+static uint64_t cuda_tmp_bytes_align(uint64_t v, uint64_t a) {
+    return (v + (a - 1u)) & ~(a - 1u);
+}
+
+/* Stage 1 (C5): session maximum for the CUDA shared tmp arena
+ * (cuda_tmp_alloc in ds4_cuda.cu), computed site by site from the census
+ * in spec-stage1-c2.md re-checked against the post-C4 code. Each block
+ * mirrors the reachability gates of its call site (including the same
+ * getenv checks as ds4_cuda.cu) and evaluates the size formula at the
+ * session bound: prefill_cap for batch token counts, g->comp_cap
+ * (ctx/min_ratio + 2) for position-dependent compressed-row counts.
+ * Sites unreachable with this session configuration contribute nothing.
+ * cuBLAS availability and the q8 f16/f32 expansion cache state are not
+ * knowable here, so every branch a matmul can take at runtime is
+ * included (worst case per site). quality/mtp_ready/mtp_draft_tokens are
+ * passed explicitly because one caller (the sessionless greedy path,
+ * generate_metal_graph_raw_swa) has no ds4_engine at hand. */
+static uint64_t cuda_tmp_session_max_bytes(bool quality,
+                                           bool mtp_ready,
+                                           int mtp_draft_tokens,
+                                           const ds4_gpu_graph *g,
+                                           const ds4_layer_weights *shape_layer,
+                                           uint32_t prefill_cap) {
+    /* Batch-row bound: prefill chunks dominate; MTP adds the verify batch
+     * (draft+1) and the DS4_N_HC-row h_proj matmul, which matter only
+     * when the prefill cap is tiny. */
+    uint64_t max_rows = prefill_cap ? prefill_cap : 1u;
+    if (mtp_ready) {
+        if (mtp_draft_tokens > 0) {
+            max_rows = cuda_tmp_bytes_max(max_rows,
+                                          (uint64_t)mtp_draft_tokens + 1u);
+        }
+        max_rows = cuda_tmp_bytes_max(max_rows, (uint64_t)DS4_N_HC);
+    }
+    const uint64_t P = max_rows;
+    const uint64_t C = g->comp_cap;      /* ratio-4 compressed-row bound */
+    const uint64_t K = DS4_N_INDEXER_TOP_K;
+    const uint64_t H = DS4_N_HEAD;
+    const uint64_t D = DS4_N_HEAD_DIM;
+    const uint64_t G = DS4_N_OUT_GROUP;
+    const uint64_t group_dim = D * (H / G);
+    const uint64_t low_dim = G * (uint64_t)DS4_N_LORA_O;
+    const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
+    const uint64_t shared_dim = shape_layer->ffn_gate_shexp->dim[1];
+    uint64_t max_bytes = 0;
+
+    /* Site "indexer topk tree" (ds4_gpu_indexer_topk_tensor, chunked
+     * top-k): reachable only when, at the n_comp bound, none of the pow2
+     * kernels takes the call first (same env gates as the shim). The
+     * scratch grows with n_comp, i.e. with position: the dangerous site
+     * n.1 of the C2 census. n_tokens and n_comp are both taken at their
+     * bound because a re-prefill can run full chunks at full n_comp. */
+    {
+        const int no2048 = getenv("DS4_CUDA_NO_TOPK2048") != NULL;
+        const int no8192 = getenv("DS4_CUDA_NO_TOPK8192") != NULL;
+        const int nochunked = getenv("DS4_CUDA_NO_TOPK_CHUNKED") != NULL;
+        if (K == 512u && !no2048 && !nochunked &&
+            C > 4096u && !(C <= 8192u && !no8192)) {
+            /* chunk_n = 4096, DS4_CUDA_TOPK_MERGE_GROUP = 8 */
+            const uint64_t n_chunks = (C + 4095u) / 4096u;
+            uint64_t per_token_u32 = n_chunks * K;
+            uint64_t n_sets = n_chunks;
+            while (n_sets > 8u) {
+                n_sets = (n_sets + 7u) / 8u;
+                per_token_u32 += n_sets * K;
+            }
+            max_bytes = cuda_tmp_bytes_max(max_bytes,
+                                           P * per_token_u32 * 4u);
+        }
+    }
+
+    /* Sites "q8 f16 gemm activations" / "q8_0 prequant" (batch q8_0
+     * matmuls, n_tok > 1: qkv projections, attn_output_b at low_dim,
+     * shared/MTP projections). Which variant serves a given matmul
+     * depends on the runtime expansion-cache state, so both contribute.
+     * Largest batch q8_0 input: attn_output_b (low_dim). */
+    {
+        const uint64_t in_dim = cuda_tmp_bytes_max((uint64_t)DS4_N_EMBD,
+                                                   low_dim);
+        const uint64_t blocks = (in_dim + 31u) / 32u;
+        max_bytes = cuda_tmp_bytes_max(max_bytes, P * in_dim * 2u);
+        max_bytes = cuda_tmp_bytes_max(max_bytes,
+                cuda_tmp_bytes_align(P * blocks * 32u, 16u) +
+                P * blocks * 4u);
+    }
+
+    /* Site "q8_0 pair prequant" (n_tok == 1): decode fused QKV pair and
+     * the shared gate+up pair of the C4 cluster, both at in_dim n_embd. */
+    {
+        const uint64_t blocks = ((uint64_t)DS4_N_EMBD + 31u) / 32u;
+        max_bytes = cuda_tmp_bytes_max(max_bytes,
+                cuda_tmp_bytes_align(blocks * 32u, 16u) + blocks * 4u);
+    }
+
+    /* Site "q8_0 hc expand prequant" (n_tok == 1): fused attention
+     * output at in_dim low_dim and shared-expert down at shared_dim.
+     * The C2 census listed only the down; the attention path dominates. */
+    {
+        const uint64_t in_dim = cuda_tmp_bytes_max(low_dim, shared_dim);
+        const uint64_t blocks = (in_dim + 31u) / 32u;
+        max_bytes = cuda_tmp_bytes_max(max_bytes,
+                cuda_tmp_bytes_align(blocks * 32u, 16u) + blocks * 4u);
+    }
+
+    /* Site "f16 gemm activations" (batch f16 matmuls, n_tok > 1): the hc
+     * mixing matmul has the largest input (n_hc * n_embd per row). */
+    max_bytes = cuda_tmp_bytes_max(max_bytes, P * hc_dim * 2u);
+
+    /* Shared gating of the two cuBLAS attention sites: the window kernel
+     * (no tmp) takes n_tokens >= 128 outside quality mode; forcing it via
+     * env removes the cuBLAS sites, disabling it via env (or quality
+     * mode) exposes them to full prefill chunks. */
+    {
+        const int no_window = getenv("DS4_CUDA_NO_WINDOW_ATTENTION") != NULL;
+        const int force_window = getenv("DS4_CUDA_WINDOW_ATTENTION") != NULL;
+        const int no_cublas = getenv("DS4_CUDA_NO_CUBLAS_ATTENTION") != NULL;
+        uint64_t n_att = 0;
+        if (!no_cublas && D == 512u) {
+            if (force_window && !no_window) {
+                n_att = 0;
+            } else if (quality || no_window) {
+                n_att = P;
+            } else {
+                n_att = P < 127u ? P : 127u;
+            }
+        }
+        if (n_att > 1u) {
+            /* Site "attention raw cublas" (raw-only prefill chunks):
+             * n_keys == n_tokens. */
+            {
+                const uint64_t score = H * n_att * n_att * 4u;
+                const uint64_t out = H * n_att * D * 4u;
+                max_bytes = cuda_tmp_bytes_max(max_bytes,
+                        cuda_tmp_bytes_align(score, 256u) + out);
+            }
+            /* Site "attention mixed cublas" (static mixed prefill):
+             * n_keys = n_tokens + n_comp, where n_comp is bounded by K on
+             * ratio-4 layers (past K rows the indexed path takes over)
+             * and by the per-layer comp cap on the other compressing
+             * layers. */
+            {
+                uint64_t comp_static = 0;
+                for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+                    const uint32_t ratio = ds4_layer_compress_ratio(il);
+                    if (ratio == 0u) continue;
+                    uint64_t cap = g->layer_comp_cap[il];
+                    if (ratio == 4u && cap > K) cap = K;
+                    comp_static = cuda_tmp_bytes_max(comp_static, cap);
+                }
+                const uint64_t n_keys = n_att + comp_static;
+                const uint64_t kv = n_keys * D * 4u;
+                const uint64_t score = H * n_att * n_keys * 4u;
+                const uint64_t out = H * n_att * D * 4u;
+                max_bytes = cuda_tmp_bytes_max(max_bytes,
+                        cuda_tmp_bytes_align(kv, 256u) +
+                        cuda_tmp_bytes_align(score, 256u) + out);
+            }
+        }
+    }
+
+    /* Site "indexed attention topk sort": batch indexed attention with
+     * top_k == 512 (prefill chunks past K compressed rows, MTP verify).
+     * The C2 census marked it reachable at n == 1; the code gates it on
+     * n_tokens > 1. */
+    if (K == 512u && P > 1u &&
+        getenv("DS4_CUDA_NO_INDEXED_TOPK_SORT") == NULL) {
+        max_bytes = cuda_tmp_bytes_max(max_bytes, P * K * 4u);
+    }
+
+    /* Site "attention output a cublas" (f16 path, non-quality only). */
+    {
+        uint32_t min_tokens = 2u;
+        const char *min_env = getenv("DS4_CUDA_ATTENTION_OUTPUT_A_CUBLAS_MIN");
+        if (min_env && min_env[0]) {
+            char *endp = NULL;
+            long v = strtol(min_env, &endp, 10);
+            if (endp != min_env && v > 1 && v < 4096) min_tokens = (uint32_t)v;
+        }
+        if (!quality && P >= min_tokens &&
+            getenv("DS4_CUDA_NO_CUBLAS_ATTENTION_OUTPUT_A") == NULL) {
+            const uint64_t heads_h = G * P * group_dim * 2u;
+            max_bytes = cuda_tmp_bytes_max(max_bytes,
+                    cuda_tmp_bytes_align(heads_h, 256u) +
+                    G * P * (uint64_t)DS4_N_LORA_O * 4u);
+        }
+    }
+
+    /* Site "attention output a q8 prequant": batch alternate of the
+     * previous site (quality mode, or f16 expansion cache unavailable);
+     * always included as the fallback the shim can take. */
+    {
+        const uint64_t blocks_a = (group_dim + 31u) / 32u;
+        const uint64_t x_rows = P * G;
+        max_bytes = cuda_tmp_bytes_max(max_bytes,
+                cuda_tmp_bytes_align(x_rows * blocks_a * 32u, 16u) +
+                x_rows * blocks_a * 4u);
+    }
+
+    /* Site "attention output low q8 prequant" (decode fused path,
+     * n_tok == 1, x_rows == n_groups): constant. */
+    {
+        const uint64_t blocks_a = (group_dim + 31u) / 32u;
+        max_bytes = cuda_tmp_bytes_max(max_bytes,
+                cuda_tmp_bytes_align(G * blocks_a * 32u, 16u) +
+                G * blocks_a * 4u);
+    }
+
+    /* Site "routed_moe sorted pairs" (batch MoE, n_tokens > 1). The
+     * scratch layout always reserves the tile arrays; sort_expert_count
+     * is bounded by DS4_N_EXPERT (the streaming compact count can only
+     * be smaller). */
+    {
+        const uint64_t E = DS4_N_EXPERT;
+        const uint64_t pair = P * (uint64_t)DS4_N_EXPERT_USED;
+        const int q4k = shape_layer->ffn_gate_exps->type == 12u &&
+                        shape_layer->ffn_down_exps->type == 12u;
+        const int q4_tiles = q4k &&
+            getenv("DS4_CUDA_MOE_NO_Q4_EXPERT_TILES") == NULL;
+        if (P > 1u && (!q4k || q4_tiles)) {
+            const uint64_t m =
+                (!q4k && getenv("DS4_CUDA_MOE_TILE4") != NULL) ? 4u : 8u;
+            const uint64_t tile_cap = (pair + m - 1u) / m + E;
+            uint64_t bytes = E * 4u             /* counts */
+                           + (E + 1u) * 4u     /* offsets */
+                           + E * 4u            /* cursors */
+                           + pair * 4u         /* sorted pairs */
+                           + (E + 1u) * 4u     /* tile offsets */
+                           + 4u                /* tile total */
+                           + tile_cap * 4u * 2u; /* tile experts+starts */
+            /* down_tile16 depends on runtime heuristics (n_tokens >= 128,
+             * atomic down): include it whenever it is not env-disabled,
+             * as an upper bound. */
+            if (m == 8u && getenv("DS4_CUDA_MOE_NO_DOWN_TILE16") == NULL) {
+                const uint64_t tile16_cap = (pair + 15u) / 16u + E;
+                bytes += (E + 1u) * 4u + 4u + tile16_cap * 4u * 2u;
+            }
+            max_bytes = cuda_tmp_bytes_max(max_bytes, bytes);
+        }
+    }
+
+    return max_bytes;
+}
+#endif /* !DS4_NO_GPU */
+
 int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
     if (!out || !e || ctx_size <= 0) return 1;
     if (e->backend == DS4_BACKEND_CPU) {
@@ -26130,6 +26416,18 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         metal_graph_free(&s->graph);
         free(s);
         return 1;
+    }
+    /* Stage 1 (C5): pre-warm the shared tmp arena to the computed session
+     * maximum, after all bounds are known and before the first forward
+     * (spec-stage1-c5.md). One execution per session; the MTP draft
+     * bounds contribute inside the formula when mtp_ready is set. */
+    if (e->backend == DS4_BACKEND_CUDA && ds4_cuda_graphs_enabled()) {
+        ds4_cuda_tmp_prewarm((size_t)cuda_tmp_session_max_bytes(e->quality,
+                                                                e->mtp_ready,
+                                                                e->mtp_draft_tokens,
+                                                                &s->graph,
+                                                                shape_layer,
+                                                                s->prefill_cap));
     }
     s->logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
     if (e->mtp_ready) {
