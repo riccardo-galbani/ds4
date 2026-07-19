@@ -10834,6 +10834,16 @@ static bool metal_graph_debug_wants(const char *name, uint32_t il, uint32_t pos)
     return true;
 }
 
+/* Stage 2 (C7): true when any diagnostic dump could fire, i.e. the same
+ * first check metal_graph_debug_wants() applies before the NAME/LAYER/POS
+ * filters. The cluster capture predicate must be conservative: dumping
+ * synchronizes and restarts the command batch, which is invalid inside a
+ * captured region, so any dump possible anywhere disables capture. */
+static bool metal_graph_debug_dump_possible(void) {
+    const char *prefix = getenv("DS4_METAL_GRAPH_DUMP_PREFIX");
+    return prefix && prefix[0];
+}
+
 static void metal_graph_debug_dump_tensor(
         const char       *name,
         ds4_gpu_tensor *t,
@@ -15984,13 +15994,22 @@ static bool metal_graph_encode_decode_layer(
         metal_graph_debug_dump_tensor("ffn_moe_out", g->routed_out, DS4_N_EMBD, il, pos);
     }
     int cluster_rc = -1;
-    if (ok && fuse_shared_gate_up && fuse_shared_down_hc && !g->spec_capture_prefix1 && !decode_stage_profile) {
+    if (ok && fuse_shared_gate_up && fuse_shared_down_hc && !g->spec_capture_prefix1 && !decode_stage_profile &&
+        !g->ssd_streaming && !g_expert_profile.active && !metal_graph_debug_dump_possible()) {
         cluster_rc = ds4_gpu_cluster_ffn_begin(il, g->ffn_norm, g->shared_gate,
                                                g->shared_up, g->shared_mid,
                                                g->after_ffn_hc,
                                                layer->ffn_gate_shexp->abs_offset,
                                                layer->ffn_up_shexp->abs_offset,
-                                               layer->ffn_down_shexp->abs_offset);
+                                               layer->ffn_down_shexp->abs_offset,
+                                               g->routed_out, g->routed_gate,
+                                               g->routed_up, g->routed_mid,
+                                               g->routed_down,
+                                               g->router_selected,
+                                               g->router_weights,
+                                               layer->ffn_gate_exps->abs_offset,
+                                               layer->ffn_up_exps->abs_offset,
+                                               layer->ffn_down_exps->abs_offset);
     }
     if (ok && cluster_rc != 1 && fuse_shared_gate_up) {
         ok = ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(g->shared_gate,

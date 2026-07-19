@@ -395,6 +395,24 @@ typedef struct {
     uint64_t    gate_offset;
     uint64_t    up_offset;
     uint64_t    down_offset;
+    /* Stage 2 (C7): device arguments consumed by the four MoE launches
+     * that join the captured perimeter at C8 (routed_moe_launch at
+     * n_tokens == 1: x quantize -> gate/up/mid -> mid quantize ->
+     * down_sum6). x is already covered by x_ptr above; routed_down and
+     * routed_gate double as the xq/midq scratch. The per-layer expert
+     * weight offsets are redundant with the slot but the match is on
+     * the full key and the cost is zero (same philosophy as C4). All
+     * fields are 8-byte, no padding: memcmp stays valid. */
+    const void *routed_out_ptr;
+    const void *routed_gate_ptr;
+    const void *routed_up_ptr;
+    const void *routed_mid_ptr;
+    const void *routed_down_ptr;
+    const void *router_selected_ptr;
+    const void *router_weights_ptr;
+    uint64_t    routed_gate_offset;
+    uint64_t    routed_up_offset;
+    uint64_t    routed_down_offset;
 } ds4_cluster_graph_key;
 
 typedef enum {
@@ -618,7 +636,14 @@ extern "C" int ds4_gpu_cluster_ffn_begin(
         const ds4_gpu_tensor *x, const ds4_gpu_tensor *gate,
         const ds4_gpu_tensor *up, const ds4_gpu_tensor *mid,
         const ds4_gpu_tensor *out_hc,
-        uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset) {
+        uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset,
+        const ds4_gpu_tensor *routed_out, const ds4_gpu_tensor *routed_gate,
+        const ds4_gpu_tensor *routed_up, const ds4_gpu_tensor *routed_mid,
+        const ds4_gpu_tensor *routed_down,
+        const ds4_gpu_tensor *router_selected,
+        const ds4_gpu_tensor *router_weights,
+        uint64_t routed_gate_offset, uint64_t routed_up_offset,
+        uint64_t routed_down_offset) {
     ds4_cluster_graph_key key;
     key.x_ptr = x->ptr;
     key.gate_ptr = gate->ptr;
@@ -628,6 +653,16 @@ extern "C" int ds4_gpu_cluster_ffn_begin(
     key.gate_offset = gate_offset;
     key.up_offset = up_offset;
     key.down_offset = down_offset;
+    key.routed_out_ptr = routed_out->ptr;
+    key.routed_gate_ptr = routed_gate->ptr;
+    key.routed_up_ptr = routed_up->ptr;
+    key.routed_mid_ptr = routed_mid->ptr;
+    key.routed_down_ptr = routed_down->ptr;
+    key.router_selected_ptr = router_selected->ptr;
+    key.router_weights_ptr = router_weights->ptr;
+    key.routed_gate_offset = routed_gate_offset;
+    key.routed_up_offset = routed_up_offset;
+    key.routed_down_offset = routed_down_offset;
     return ds4_cluster_graph_begin(il, &key);
 }
 

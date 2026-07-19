@@ -1023,7 +1023,17 @@ int ds4_gpu_cluster_ffn_begin(
         const ds4_gpu_tensor *out_hc,
         uint64_t                gate_offset,
         uint64_t                up_offset,
-        uint64_t                down_offset);
+        uint64_t                down_offset,
+        const ds4_gpu_tensor *routed_out,
+        const ds4_gpu_tensor *routed_gate,
+        const ds4_gpu_tensor *routed_up,
+        const ds4_gpu_tensor *routed_mid,
+        const ds4_gpu_tensor *routed_down,
+        const ds4_gpu_tensor *router_selected,
+        const ds4_gpu_tensor *router_weights,
+        uint64_t                routed_gate_offset,
+        uint64_t                routed_up_offset,
+        uint64_t                routed_down_offset);
 
 /* Call ONLY after begin() returned 0 and BOTH shims ran. Returns 0 = graph
  * committed and this token's work launched; -1 = capture failed, CALLER
