@@ -15984,7 +15984,7 @@ static bool metal_graph_encode_decode_layer(
         metal_graph_debug_dump_tensor("ffn_moe_out", g->routed_out, DS4_N_EMBD, il, pos);
     }
     int cluster_rc = -1;
-    if (ok && fuse_shared_gate_up && fuse_shared_down_hc && !decode_stage_profile) {
+    if (ok && fuse_shared_gate_up && fuse_shared_down_hc && !g->spec_capture_prefix1 && !decode_stage_profile) {
         cluster_rc = ds4_gpu_cluster_ffn_begin(il, g->ffn_norm, g->shared_gate,
                                                g->shared_up, g->shared_mid,
                                                g->after_ffn_hc,

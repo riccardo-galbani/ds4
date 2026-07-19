@@ -260,7 +260,10 @@ static void ds4_capture_set_stream(cudaStream_t stream) {
  * NonBlocking is required: while a capture is active, any use of the
  * legacy stream is invalid if other streams in the context are blocking
  * (CUDA Programming Guide 13.3, "Prohibited and Unhandled Operations").
- * The three pre-existing helper streams are already NonBlocking. */
+ * The three pre-existing helper streams are already NonBlocking.
+ * Stage 2 (C6): DS4_CUDA_MOE_PROFILE and DS4_CUDA_GRAPHS are mutually
+ * exclusive — with profiling set, capture is disabled (eager fallback,
+ * one-time warning in ds4_cluster_graph_begin). */
 static cudaStream_t g_ds4_graph_stream = (cudaStream_t)0;
 
 static cudaEvent_t g_cluster_ev_pre  = (cudaEvent_t)0;
@@ -470,6 +473,7 @@ static int ds4_cluster_graph_begin(uint32_t il,
      * the profiling path does host-side event sync inline in the MoE
      * body, which is invalid inside a captured region. */
     static int s_moe_profile = -1;
+    static bool s_moe_profile_warned = false;
     if (s_moe_profile < 0) {
         s_moe_profile = (getenv("DS4_CUDA_MOE_PROFILE") != NULL) ? 1 : 0;
     }
@@ -477,6 +481,16 @@ static int ds4_cluster_graph_begin(uint32_t il,
         g_ds4_graph_stream == (cudaStream_t)0 ||
         il >= DS4_CLUSTER_GRAPH_MAX_LAYERS ||
         s_moe_profile) {
+        if (s_moe_profile && !s_moe_profile_warned &&
+            ds4_cuda_graphs_gate_enabled() &&
+            g_ds4_graph_stream != (cudaStream_t)0) {
+            fprintf(stderr,
+                "ds4-cuda-graphs: WARNING: DS4_CUDA_MOE_PROFILE is set: "
+                "MoE profiling and CUDA graph capture are mutually "
+                "exclusive; DS4_CUDA_GRAPHS capture is disabled, falling "
+                "back to eager launches.\n");
+            s_moe_profile_warned = true;
+        }
         g_cluster_stat_eager++;
         return -1;
     }
@@ -12828,8 +12842,8 @@ static int routed_moe_launch(
                 tile16_total = use_down_tile16 ? (uint32_t *)(scratch + tile16_total_off) : NULL;
                 tile16_experts = use_down_tile16 ? (uint32_t *)(scratch + tile16_experts_off) : NULL;
                 tile16_starts = use_down_tile16 ? (uint32_t *)(scratch + tile16_starts_off) : NULL;
-                /* NOTE: sync memset on default stream; must become cudaMemsetAsync(ds4_current_stream()) before MoE graph capture (Stage 2) — sync memory ops are illegal inside stream capture. */
-                ok = cuda_ok(cudaMemset(counts, 0, counts_bytes), "routed_moe sorted counts clear");
+                /* Stage 2 (C6): converted to cudaMemsetAsync — safe: producer and consumers (count/prefix kernels below) run on the same ds4_current_stream(). */
+                ok = cuda_ok(cudaMemsetAsync(counts, 0, counts_bytes, ds4_current_stream()), "routed_moe sorted counts clear");
                 if (ok) {
                     moe_count_sorted_pairs_kernel<<<(pair_count + 255u) / 256u, 256, 0, ds4_current_stream()>>>(
                         counts,
