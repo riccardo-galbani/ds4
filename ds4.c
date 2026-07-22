@@ -16988,6 +16988,17 @@ static int metal_graph_first_token_full_test(
  * flow and their CPU reads stay outside these generation entry points.
  */
 
+/* Stage 3 (C9): implemented in ds4_cuda.cu — populates the device
+ * substrate before a decode forward pass (no-op when gate is off). */
+extern void ds4_cuda_decode_scalars_populate(
+    int32_t   token,
+    uint32_t  pos0,
+    uint32_t  raw_row,
+    uint32_t  n_raw,
+    uint32_t  raw_start,
+    const uint32_t *layer_n_comp,
+    const uint32_t *layer_n_index_comp);
+
 static uint32_t metal_graph_token_split_after_layers(void) {
     uint32_t split_after_layers = 4;
 #ifndef DS4_ROCM_BUILD
@@ -17017,6 +17028,10 @@ static bool metal_graph_encode_token_raw_swa(
     }
     const uint32_t raw_row = pos % g->raw_cap;
     const uint32_t n_raw = metal_graph_raw_span_for_batch(g, pos, 1);
+    ds4_cuda_decode_scalars_populate(
+        token, pos, raw_row, n_raw,
+        metal_graph_raw_start_for_span(g, pos, n_raw),
+        g->layer_n_comp, g->layer_n_index_comp);
 
     bool ok = ds4_gpu_embed_token_hc_tensor(g->cur_hc,
                                               model->map,
@@ -23069,6 +23084,7 @@ static int generate_metal_graph_raw_swa(
                                                                 &g,
                                                                 &weights->layer[0],
                                                                 prefill_cap));
+        ds4_cuda_decode_scalars_alloc();
     }
     const bool memory_report = getenv("DS4_METAL_MEMORY_REPORT") != NULL;
     if (memory_report) ds4_gpu_print_memory_report("after graph alloc");
@@ -26447,6 +26463,7 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
                                                                 &s->graph,
                                                                 shape_layer,
                                                                 s->prefill_cap));
+        ds4_cuda_decode_scalars_alloc();
     }
     s->logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
     if (e->mtp_ready) {

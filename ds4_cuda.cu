@@ -370,6 +370,83 @@ extern "C" void ds4_cuda_tmp_prewarm(size_t bytes) {
         bytes, (unsigned long long)g_cuda_tmp_generation);
 }
 
+/* Stage 3 (C9): device-side substrate for per-token scalars that
+ * currently travel as kernel arguments. Once the shims in C10 read
+ * from this substrate, a captured graph replays with the updated
+ * scalars without re-capture. Populated by the host before each
+ * decode forward pass; pointer stable for the life of the session. */
+typedef struct __align__(16) {
+    /* Per-token fields (populated once per forward). */
+    int32_t  token;         /* embed_token_hc, router_select (hash mode) */
+    uint32_t pos0;          /* rope_tail, head_rms_norm_rope_tail,
+                               attention_indexed_mixed_batch_heads */
+    uint32_t raw_row;       /* store_raw_kv, kv_fp8_store_raw (= pos % raw_cap) */
+    uint32_t n_raw;         /* attention_decode_heads, attention_indexed_* */
+    uint32_t raw_start;     /* attention_decode_heads, attention_indexed_* */
+
+    /* Per-layer fields.  n_comp, comp_row, index_row vary across the 43
+     * layers; the host fills them from the graph's layer_n_comp /
+     * layer_n_index_comp arrays before each forward.  Array length =
+     * DS4_N_LAYER (43); padding to 64 for alignment headroom. */
+    uint32_t n_comp[64];      /* attention_*, indexer_score_one, indexer_topk */
+    uint32_t comp_row[64];    /* compressor_update (= layer_n_comp[il]) */
+    uint32_t index_row[64];   /* compressor_update / indexer_qat (= layer_n_index_comp[il]) */
+} ds4_decode_scalars;
+
+#define DS4_DECODE_SCALARS_N_LAYER 43u
+
+static ds4_decode_scalars *g_decode_scalars_dev = NULL;
+
+/* Stage 3 (C9): allocate the device-side substrate for per-token
+ * decode scalars. Called once per session from both creation paths
+ * (ds4_session_create and generate_metal_graph_raw_swa), after the
+ * graph is allocated and before the first forward pass. Idempotente:
+ * a second call is a no-op (global substrate, shared across sessions
+ * in the sessionless path which creates a new graph per generation). */
+extern "C" void ds4_cuda_decode_scalars_alloc(void) {
+    if (g_decode_scalars_dev) return;
+    if (!ds4_cuda_graphs_gate_enabled()) return;
+    if (!cuda_ok(cudaMalloc(&g_decode_scalars_dev, sizeof(ds4_decode_scalars)),
+                 "decode scalars alloc")) {
+        g_decode_scalars_dev = NULL;
+    }
+}
+
+/* Stage 3 (C9): populate the device substrate before a decode forward
+ * pass. The caller provides all per-token scalars and the per-layer
+ * comp/index counts. The copy is a single cudaMemcpyAsync on the
+ * current stream, ordered before all kernel launches of this token.
+ * No-op when the substrate is not allocated (gate off). */
+extern "C" void ds4_cuda_decode_scalars_populate(
+    int32_t   token,
+    uint32_t  pos0,
+    uint32_t  raw_row,
+    uint32_t  n_raw,
+    uint32_t  raw_start,
+    const uint32_t *layer_n_comp,
+    const uint32_t *layer_n_index_comp)
+{
+    if (!g_decode_scalars_dev) return;
+    ds4_decode_scalars host;
+    memset(&host, 0, sizeof(host));
+    host.token = token;
+    host.pos0 = pos0;
+    host.raw_row = raw_row;
+    host.n_raw = n_raw;
+    host.raw_start = raw_start;
+    memcpy(host.n_comp,    layer_n_comp,       DS4_DECODE_SCALARS_N_LAYER * sizeof(uint32_t));
+    memcpy(host.comp_row,  layer_n_comp,       DS4_DECODE_SCALARS_N_LAYER * sizeof(uint32_t));
+    memcpy(host.index_row, layer_n_index_comp, DS4_DECODE_SCALARS_N_LAYER * sizeof(uint32_t));
+    cudaMemcpyAsync(g_decode_scalars_dev, &host, sizeof(host),
+                    cudaMemcpyHostToDevice, ds4_current_stream());
+}
+
+/* Stage 3 (C9): returns the device pointer to the decode scalars
+ * substrate, or NULL if not allocated. Stable for the session. */
+const ds4_decode_scalars *ds4_cuda_decode_scalars_ptr(void) {
+    return g_decode_scalars_dev;
+}
+
 /* Stage 1 (C3): shared-expert FFN cluster graphs, set-associative with
  * DS4_CLUSTER_GRAPH_WAYS ways per layer. A single slot per layer is not
  * enough: the decode loop swaps g->cur_hc / g->after_ffn_hc after every
@@ -2721,6 +2798,10 @@ extern "C" void ds4_gpu_cleanup(void) {
             g_cluster_graphs[i][w].exec = NULL;
             g_cluster_graphs[i][w].state = DS4_CLUSTER_SLOT_EMPTY;
         }
+    }
+    if (g_decode_scalars_dev) {
+        (void)cudaFree(g_decode_scalars_dev);
+        g_decode_scalars_dev = NULL;
     }
     if (g_cublas_ready) {
         (void)cublasDestroy(g_cublas);
