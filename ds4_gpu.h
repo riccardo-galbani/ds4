@@ -22,6 +22,9 @@ typedef struct ds4_gpu_tensor ds4_gpu_tensor;
 int ds4_gpu_init(void);
 void ds4_gpu_cleanup(void);
 void ds4_cuda_decode_scalars_alloc(void);
+void ds4_cuda_decode_scalars_unpopulate(void);
+void ds4_cuda_set_current_layer(uint32_t il);
+void ds4_cuda_set_index_comp_cache_base(ds4_gpu_tensor *cache);
 
 ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes);
 ds4_gpu_tensor *ds4_gpu_tensor_alloc_managed(uint64_t bytes);

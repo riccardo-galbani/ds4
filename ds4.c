@@ -14860,6 +14860,7 @@ static bool metal_graph_encode_decode_layer(
         uint32_t                raw_row,
         uint32_t                n_raw,
         int                     token) {
+    ds4_cuda_set_current_layer(il);
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
     const uint64_t mix_hc = 2ull * DS4_N_HC + (uint64_t)DS4_N_HC * DS4_N_HC;
     const uint64_t q_rank = layer->attn_q_a->dim[1];
@@ -15237,6 +15238,7 @@ static bool metal_graph_encode_decode_layer(
                                                             DS4_ROPE_YARN_BETA_SLOW,
                                                             DS4_RMS_EPS) != 0;
             if (ok && emit) {
+                ds4_cuda_set_index_comp_cache_base(g->layer_index_comp_cache[il]);
                 ds4_gpu_tensor *index_row_view = ds4_gpu_tensor_view(
                         g->layer_index_comp_cache[il],
                         (uint64_t)index_row * DS4_N_INDEXER_HEAD_DIM * sizeof(float),
@@ -17069,6 +17071,7 @@ static bool metal_graph_encode_token_raw_swa(
             ok = ds4_gpu_flush_commands() != 0;
         }
     }
+    ds4_cuda_decode_scalars_unpopulate();
 
     if (ok && need_logits) {
         ok = metal_graph_encode_output_head(g, model, weights, weights->output->dim[1]);
