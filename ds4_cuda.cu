@@ -455,6 +455,7 @@ const ds4_decode_scalars *ds4_cuda_decode_scalars_ptr(void) {
 
 static __thread uint32_t g_current_layer_index = 0;
 static __thread float   *g_index_comp_cache_base = NULL;
+static __thread bool     g_capture_active = false;
 
 extern "C" void ds4_cuda_set_current_layer(uint32_t il) {
     g_current_layer_index = il;
@@ -462,6 +463,14 @@ extern "C" void ds4_cuda_set_current_layer(uint32_t il) {
 
 extern "C" void ds4_cuda_set_index_comp_cache_base(ds4_gpu_tensor *cache) {
     g_index_comp_cache_base = cache ? (float *)cache->ptr : NULL;
+}
+
+extern "C" bool ds4_cuda_capture_active(void) {
+    return g_capture_active;
+}
+
+extern "C" void ds4_cuda_set_capture_active(bool active) {
+    g_capture_active = active;
 }
 
 /* Stage 1 (C3): shared-expert FFN cluster graphs, set-associative with
@@ -592,7 +601,8 @@ static int ds4_cluster_graph_begin(uint32_t il,
     if (!ds4_cuda_graphs_gate_enabled() ||
         g_ds4_graph_stream == (cudaStream_t)0 ||
         il >= DS4_CLUSTER_GRAPH_MAX_LAYERS ||
-        s_moe_profile) {
+        s_moe_profile ||
+        g_capture_active) {
         if (s_moe_profile && !s_moe_profile_warned &&
             ds4_cuda_graphs_gate_enabled() &&
             g_ds4_graph_stream != (cudaStream_t)0) {

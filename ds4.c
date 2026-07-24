@@ -13579,6 +13579,23 @@ static void metal_graph_attn_comp_prefill_target_free(ds4_gpu_tensor *t) {
     if (!DS4_GPU_ATTN_COMP_CACHE_F16) ds4_gpu_tensor_free(t);
 }
 
+__attribute__((unused))
+static void metal_graph_layer_replay_side_effects(
+        ds4_gpu_graph *g,
+        uint32_t       il,
+        uint32_t       pos) {
+    const uint32_t ratio = ds4_layer_compress_ratio(il);
+    if (ratio == 0) return;
+    const bool emit = ((pos + 1u) % ratio) == 0u;
+    if (!emit) return;
+    if (g->layer_n_comp[il] < g->layer_comp_cap[il]) {
+        g->layer_n_comp[il]++;
+    }
+    if (ratio == 4u) {
+        g->layer_n_index_comp[il]++;
+    }
+}
+
 /* Encode one DS4 decode layer on Metal.  This is the release single-token
  * layer path; diagnostics reuse it so they compare exactly what generation
  * runs. */
