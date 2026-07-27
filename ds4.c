@@ -15152,6 +15152,7 @@ static bool metal_graph_encode_decode_layer(
                                                      g->attn_norm, 1) != 0;
         }
         const uint32_t comp_row = g->layer_n_comp[il];
+        ds4_cuda_set_compressor_is_indexer(false);
         if (ok) ok = ds4_gpu_compressor_update_tensor(g->comp_kv_cur,
                                                         g->comp_sc_cur,
                                                         g->layer_attn_state_kv[il],
@@ -15181,7 +15182,13 @@ static bool metal_graph_encode_decode_layer(
             if (!comp_row_view) {
                 ok = false;
             } else {
+                /* The row view address is baked into a captured graph; the
+                 * quantizer re-derives it from the substrate while armed.
+                 * Disarm on the next line, before anything else can reach the
+                 * same shim for the raw KV row. */
+                ds4_cuda_set_attn_comp_cache_base(g->layer_attn_comp_cache[il]);
                 ok = ds4_gpu_dsv4_fp8_kv_quantize_tensor(comp_row_view, 1, DS4_N_HEAD_DIM, DS4_N_ROT) != 0;
+                ds4_cuda_set_attn_comp_cache_base(NULL);
                 if (ok) {
                     metal_graph_debug_dump_tensor("KVcompress", comp_row_view, DS4_N_HEAD_DIM, il, pos);
                 }
@@ -15230,6 +15237,7 @@ static bool metal_graph_encode_decode_layer(
                                                          g->attn_norm, 1) != 0;
             }
             const uint32_t index_row = g->layer_n_index_comp[il];
+            ds4_cuda_set_compressor_is_indexer(true);
             if (ok) ok = ds4_gpu_compressor_update_tensor(g->comp_kv_cur,
                                                             g->comp_sc_cur,
                                                             g->layer_index_state_kv[il],
@@ -17008,7 +17016,11 @@ static int metal_graph_first_token_full_test(
  */
 
 /* Stage 3 (C9): implemented in ds4_cuda.cu — populates the device
- * substrate before a decode forward pass (no-op when gate is off). */
+ * substrate before a decode forward pass (no-op when gate is off).
+ * Stage 3 (C11b): layer_n_comp_visible is layer_n_comp already advanced by the
+ * row this token's compressor emits — the count the attention and indexer
+ * kernels must see.  layer_n_comp itself stays pre-increment because it is the
+ * write destination of the compressor. */
 extern void ds4_cuda_decode_scalars_populate(
     int32_t   token,
     uint32_t  pos0,
@@ -17016,7 +17028,8 @@ extern void ds4_cuda_decode_scalars_populate(
     uint32_t  n_raw,
     uint32_t  raw_start,
     const uint32_t *layer_n_comp,
-    const uint32_t *layer_n_index_comp);
+    const uint32_t *layer_n_index_comp,
+    const uint32_t *layer_n_comp_visible);
 
 static uint32_t metal_graph_token_split_after_layers(void) {
     uint32_t split_after_layers = 4;
@@ -17047,10 +17060,21 @@ static bool metal_graph_encode_token_raw_swa(
     }
     const uint32_t raw_row = pos % g->raw_cap;
     const uint32_t n_raw = metal_graph_raw_span_for_batch(g, pos, 1);
+    /* Stage 3 (C11b): the emit predicate is the same one the layer encoder uses
+     * below (metal_graph_encode_decode_layer), so the count the kernels read is
+     * the count the host reads after its own increment — by construction, and
+     * without a per-layer thread-local the batch path could corrupt. */
+    uint32_t n_comp_visible[DS4_MAX_LAYER];
+    memset(n_comp_visible, 0, sizeof(n_comp_visible));
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        const uint32_t ratio = ds4_layer_compress_ratio(il);
+        const bool emit = ratio != 0 && ((pos + 1u) % ratio) == 0u;
+        n_comp_visible[il] = g->layer_n_comp[il] + (emit ? 1u : 0u);
+    }
     ds4_cuda_decode_scalars_populate(
         token, pos, raw_row, n_raw,
         metal_graph_raw_start_for_span(g, pos, n_raw),
-        g->layer_n_comp, g->layer_n_index_comp);
+        g->layer_n_comp, g->layer_n_index_comp, n_comp_visible);
 
     bool ok = ds4_gpu_embed_token_hc_tensor(g->cur_hc,
                                               model->map,
@@ -18053,6 +18077,7 @@ static bool metal_graph_encode_layer_attention_batch(
                     ds4_gpu_tensor *kv_view = metal_graph_tensor_row_view(g->batch_comp_kv, t, comp_width);
                     ds4_gpu_tensor *sc_view = metal_graph_tensor_row_view(g->batch_comp_sc, t, comp_width);
                     const uint32_t comp_row = g->layer_n_comp[il];
+                    ds4_cuda_set_compressor_is_indexer(false);
                     ok = kv_view && sc_view &&
                          ds4_gpu_compressor_update_tensor(kv_view,
                                                             sc_view,
@@ -18080,11 +18105,15 @@ static bool metal_graph_encode_layer_attention_batch(
                                                             DS4_RMS_EPS) != 0;
                     if (ok && emit) {
                         ds4_gpu_tensor *comp_row_view = metal_graph_attn_comp_row_view(g, il, comp_row);
+                        /* Armed and disarmed around the single call, so the
+                         * short circuit above cannot leave it set. */
+                        ds4_cuda_set_attn_comp_cache_base(g->layer_attn_comp_cache[il]);
                         ok = comp_row_view &&
                              ds4_gpu_dsv4_fp8_kv_quantize_tensor(comp_row_view,
                                                                    1,
                                                                    DS4_N_HEAD_DIM,
                                                                    DS4_N_ROT) != 0;
+                        ds4_cuda_set_attn_comp_cache_base(NULL);
                         if (ok) {
                             metal_graph_debug_dump_tensor("KVcompress",
                                                           comp_row_view,
@@ -18345,6 +18374,7 @@ static bool metal_graph_encode_layer_attention_batch(
                         ds4_gpu_tensor *kv_view = metal_graph_tensor_row_view(g->batch_comp_kv, t, index_width);
                         ds4_gpu_tensor *sc_view = metal_graph_tensor_row_view(g->batch_comp_sc, t, index_width);
                         const uint32_t index_row = g->layer_n_index_comp[il];
+                        ds4_cuda_set_compressor_is_indexer(true);
                         ok = kv_view && sc_view &&
                              ds4_gpu_compressor_update_tensor(kv_view,
                                                                 sc_view,

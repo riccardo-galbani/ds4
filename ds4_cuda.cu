@@ -387,7 +387,15 @@ typedef struct __align__(16) {
     /* Per-layer fields.  n_comp, comp_row, index_row vary across the 43
      * layers; the host fills them from the graph's layer_n_comp /
      * layer_n_index_comp arrays before each forward.  Array length =
-     * DS4_N_LAYER (43); padding to 64 for alignment headroom. */
+     * DS4_N_LAYER (43); padding to 64 for alignment headroom.
+     *
+     * Stage 3 (C11b): n_comp is the count the attention and indexer kernels
+     * must see, i.e. layer_n_comp[il] already advanced by the row this token's
+     * compressor is about to emit.  The host applies that predicate before the
+     * layer loop, so host and device agree by construction — including in the
+     * launch geometry and in the host-side dispatch ladders, neither of which
+     * can read the substrate.  comp_row and index_row stay pre-increment: they
+     * are write destinations, not visible-row counts. */
     uint32_t n_comp[64];      /* attention_*, indexer_score_one, indexer_topk */
     uint32_t comp_row[64];    /* compressor_update (= layer_n_comp[il]) */
     uint32_t index_row[64];   /* compressor_update / indexer_qat (= layer_n_index_comp[il]) */
@@ -425,7 +433,8 @@ extern "C" void ds4_cuda_decode_scalars_populate(
     uint32_t  n_raw,
     uint32_t  raw_start,
     const uint32_t *layer_n_comp,
-    const uint32_t *layer_n_index_comp)
+    const uint32_t *layer_n_index_comp,
+    const uint32_t *layer_n_comp_visible)
 {
     if (!g_decode_scalars_dev) return;
     ds4_decode_scalars host;
@@ -435,7 +444,7 @@ extern "C" void ds4_cuda_decode_scalars_populate(
     host.raw_row = raw_row;
     host.n_raw = n_raw;
     host.raw_start = raw_start;
-    memcpy(host.n_comp,    layer_n_comp,       DS4_DECODE_SCALARS_N_LAYER * sizeof(uint32_t));
+    memcpy(host.n_comp,    layer_n_comp_visible, DS4_DECODE_SCALARS_N_LAYER * sizeof(uint32_t));
     memcpy(host.comp_row,  layer_n_comp,       DS4_DECODE_SCALARS_N_LAYER * sizeof(uint32_t));
     memcpy(host.index_row, layer_n_index_comp, DS4_DECODE_SCALARS_N_LAYER * sizeof(uint32_t));
     cudaMemcpyAsync(g_decode_scalars_dev, &host, sizeof(host),
@@ -456,13 +465,31 @@ const ds4_decode_scalars *ds4_cuda_decode_scalars_ptr(void) {
 static __thread uint32_t g_current_layer_index = 0;
 static __thread float   *g_index_comp_cache_base = NULL;
 static __thread bool     g_capture_active = false;
+/* Stage 3 (C11b): which substrate row array ds4_gpu_compressor_update_tensor
+ * must read.  The shim signature is shared with the Metal backend and cannot
+ * grow a parameter, so the caller arms the flag right before the call (same
+ * pattern as g_index_comp_cache_base). */
+static __thread bool     g_compressor_is_indexer = false;
+/* Stage 3 (C11b): arms the compressed-row redirect of the FP8 KV quantizer.
+ * Unlike g_index_comp_cache_base this one MUST be disarmed right after the
+ * call: ds4_gpu_dsv4_fp8_kv_quantize_tensor has a second consumer (the raw KV
+ * row) that must keep its host pointer. */
+static __thread float   *g_attn_comp_cache_base = NULL;
 
 extern "C" void ds4_cuda_set_current_layer(uint32_t il) {
     g_current_layer_index = il;
 }
 
+extern "C" void ds4_cuda_set_compressor_is_indexer(bool is_indexer) {
+    g_compressor_is_indexer = is_indexer;
+}
+
 extern "C" void ds4_cuda_set_index_comp_cache_base(ds4_gpu_tensor *cache) {
     g_index_comp_cache_base = cache ? (float *)cache->ptr : NULL;
+}
+
+extern "C" void ds4_cuda_set_attn_comp_cache_base(ds4_gpu_tensor *cache) {
+    g_attn_comp_cache_base = cache ? (float *)cache->ptr : NULL;
 }
 
 extern "C" bool ds4_cuda_capture_active(void) {
@@ -4506,11 +4533,29 @@ __global__ static void rms_norm_plain_kernel(float *out, const float *x, uint32_
     }
 }
 
-__global__ static void rms_norm_weight_kernel(float *out, const float *x, const float *w, uint32_t n, uint32_t rows, float eps) {
+/* Stage 3 (C11b): the compressor normalizes in place the compressed row the
+ * pool kernel has just written, so `out` and `x` both carry an address that is
+ * baked at capture time.  When the substrate is active the row index is read on
+ * the device from comp_row_array, and both sides of the in-place norm are
+ * re-derived from the cache base.  All other callers pass NULL and keep the
+ * host-supplied pointers. */
+__global__ static void rms_norm_weight_kernel(float *out, const float *x, const float *w, uint32_t n, uint32_t rows, float eps,
+        const ds4_decode_scalars *subs,
+        float *comp_cache_base,
+        uint32_t comp_head_dim,
+        const uint32_t *comp_row_array,
+        uint32_t comp_il) {
     uint32_t row = blockIdx.x;
     if (row >= rows) return;
     const float *xr = x + (uint64_t)row * n;
     float *orow = out + (uint64_t)row * n;
+    if (subs && comp_cache_base && comp_row_array) {
+        float *base = comp_cache_base
+                    + (uint64_t)comp_row_array[comp_il] * comp_head_dim
+                    + (uint64_t)row * n;
+        xr = base;
+        orow = base;
+    }
     float sum = 0.0f;
     for (uint32_t i = threadIdx.x; i < n; i += blockDim.x) {
         float v = xr[i];
@@ -4678,8 +4723,22 @@ __global__ static void rope_tail_kernel(
         float attn_factor,
         float beta_fast,
         float beta_slow,
-        const ds4_decode_scalars *subs) {
-    const uint32_t pos0_v = subs ? subs->pos0 : pos0;
+        const ds4_decode_scalars *subs,
+        /* Stage 3 (C11b): compressor redirect.  comp_cache_base == NULL keeps
+         * the host-supplied buffer and position; comp_rope_ratio == 0 keeps
+         * subs->pos0 as-is.  The compressor rotates the pooled row with the
+         * position of that row in the KV cache, i.e. pos + 1 - ratio. */
+        float *comp_cache_base,
+        uint32_t comp_head_dim,
+        const uint32_t *comp_row_array,
+        uint32_t comp_il,
+        uint32_t comp_rope_ratio) {
+    uint32_t pos0_v = subs ? subs->pos0 : pos0;
+    if (subs && comp_rope_ratio > 0u) pos0_v = pos0_v + 1u - comp_rope_ratio;
+    float *x_eff = x;
+    if (subs && comp_cache_base && comp_row_array) {
+        x_eff = comp_cache_base + (uint64_t)comp_row_array[comp_il] * comp_head_dim;
+    }
     uint32_t gid = blockIdx.x * blockDim.x + threadIdx.x;
     uint32_t pairs = n_tok * n_head * (n_rot / 2);
     if (gid >= pairs) return;
@@ -4712,7 +4771,7 @@ __global__ static void rope_tail_kernel(
     float s = sinf(theta) * mscale;
     if (inverse) s = -s;
 
-    float *tail = x + ((uint64_t)t * n_head + h) * head_dim + n_nope;
+    float *tail = x_eff + ((uint64_t)t * n_head + h) * head_dim + n_nope;
     float x0 = tail[i];
     float x1 = tail[i + 1];
     tail[i] = x0 * c - x1 * s;
@@ -4810,11 +4869,22 @@ __device__ static DS4_CUDA_UNUSED void rope_tail_one_dev(float *x, uint32_t head
     }
 }
 
-__global__ static void fp8_kv_quantize_kernel(float *x, uint32_t n_tok, uint32_t head_dim, uint32_t n_rot) {
+/* Stage 3 (C11b): same redirect contract as rms_norm_weight_kernel — when the
+ * quantized rows are compressed-cache rows their address must come from the
+ * substrate, not from a pointer baked at capture time.  NULL keeps `x`. */
+__global__ static void fp8_kv_quantize_kernel(float *x, uint32_t n_tok, uint32_t head_dim, uint32_t n_rot,
+        const ds4_decode_scalars *subs,
+        float *comp_cache_base,
+        uint32_t comp_head_dim,
+        const uint32_t *comp_row_array,
+        uint32_t comp_il) {
     uint32_t row = blockIdx.x;
     uint32_t tid = threadIdx.x;
     uint32_t n_nope = head_dim - n_rot;
-    float *xr = x + (uint64_t)row * head_dim;
+    float *xr = (subs && comp_cache_base && comp_row_array)
+              ? (comp_cache_base + (uint64_t)comp_row_array[comp_il] * comp_head_dim
+                 + (uint64_t)row * head_dim)
+              : (x + (uint64_t)row * head_dim);
     __shared__ float scratch[64];
     for (uint32_t off = 0; off < n_nope; off += 64) {
         float v = 0.0f;
@@ -5192,6 +5262,17 @@ __global__ static void attention_unpack_group_low_kernel(
     low[(uint64_t)t * low_dim + (uint64_t)g * rank + r] = tmp[gid];
 }
 
+/* Stage 3 (C11b): compressed-row count seen by a kernel.  Without the substrate
+ * this is whatever the host passed; with it, subs->n_comp[il] already counts the
+ * row this token's compressor emits, because the host applies the emit predicate
+ * before the layer loop (ds4_cuda_decode_scalars_populate). */
+__device__ static inline uint32_t ds4_decode_n_comp_eff(
+        const ds4_decode_scalars *subs,
+        uint32_t il,
+        uint32_t n_comp_host) {
+    return subs ? subs->n_comp[il] : n_comp_host;
+}
+
 __global__ static void attention_decode_mixed_kernel(
         float *heads,
         const float *sinks,
@@ -5215,7 +5296,7 @@ __global__ static void attention_decode_mixed_kernel(
     const uint32_t pos0_v = subs ? subs->pos0 : pos0;
     const uint32_t n_raw_v = subs ? subs->n_raw : n_raw;
     const uint32_t raw_start_v = subs ? subs->raw_start : raw_start;
-    const uint32_t n_comp_v = subs ? subs->n_comp[il] : n_comp;
+    const uint32_t n_comp_v = ds4_decode_n_comp_eff(subs, il, n_comp);
     uint32_t t = blockIdx.x;
     uint32_t h = blockIdx.y;
     if (t >= n_tokens || h >= n_head) return;
@@ -5389,7 +5470,7 @@ __global__ static void attention_indexed_mixed_kernel(
     const uint32_t pos0_v = subs ? subs->pos0 : pos0;
     const uint32_t n_raw_v = subs ? subs->n_raw : n_raw;
     const uint32_t raw_start_v = subs ? subs->raw_start : raw_start;
-    const uint32_t n_comp_v = subs ? subs->n_comp[il] : n_comp;
+    const uint32_t n_comp_v = ds4_decode_n_comp_eff(subs, il, n_comp);
     uint32_t t = blockIdx.x;
     uint32_t h = blockIdx.y;
     if (t >= n_tokens || h >= n_head) return;
@@ -5571,7 +5652,7 @@ __global__ static void attention_indexed_mixed_heads8_rb4_kernel(
     const uint32_t pos0_v = subs ? subs->pos0 : pos0;
     const uint32_t n_raw_v = subs ? subs->n_raw : n_raw;
     const uint32_t raw_start_v = subs ? subs->raw_start : raw_start;
-    const uint32_t n_comp_v = subs ? subs->n_comp[il] : n_comp;
+    const uint32_t n_comp_v = ds4_decode_n_comp_eff(subs, il, n_comp);
     uint32_t qpos = pos0_v + t;
     uint32_t first_raw_pos = pos0_v + n_tokens - n_raw_v;
     uint32_t visible_comp = n_comp_v;
@@ -5750,7 +5831,7 @@ __global__ static void attention_indexed_mixed_heads8_online_kernel(
     const uint32_t pos0_v = subs ? subs->pos0 : pos0;
     const uint32_t n_raw_v = subs ? subs->n_raw : n_raw;
     const uint32_t raw_start_v = subs ? subs->raw_start : raw_start;
-    const uint32_t n_comp_v = subs ? subs->n_comp[il] : n_comp;
+    const uint32_t n_comp_v = ds4_decode_n_comp_eff(subs, il, n_comp);
     uint32_t qpos = pos0_v + t;
     uint32_t first_raw_pos = pos0_v + n_tokens - n_raw_v;
     uint32_t visible_comp = n_comp_v;
@@ -6043,7 +6124,7 @@ __global__ static void attention_decode_mixed_heads8_online_kernel(
     const uint32_t pos0_v = subs ? subs->pos0 : pos0;
     const uint32_t n_raw_v = subs ? subs->n_raw : n_raw;
     const uint32_t raw_start_v = subs ? subs->raw_start : raw_start;
-    const uint32_t n_comp_v = subs ? subs->n_comp[il] : n_comp;
+    const uint32_t n_comp_v = ds4_decode_n_comp_eff(subs, il, n_comp);
     const uint32_t qpos = pos0_v + t;
     const uint32_t first_raw_pos = pos0_v + n_tokens - n_raw_v;
     uint32_t comp_count = 0;
@@ -6507,8 +6588,14 @@ __global__ static void compressor_update_pool_kernel(
         const ds4_decode_scalars *subs,
         float *comp_cache_base,
         uint32_t comp_row_arg,
-        uint32_t il) {
-    float *out = subs ? (comp_cache_base + (uint64_t)subs->comp_row[il] * head_dim) : row;
+        uint32_t il,
+        /* Stage 3 (C11b): &subs->comp_row[0] for the attention compressor,
+         * &subs->index_row[0] for the indexer one.  Reading subs->comp_row[il]
+         * unconditionally was wrong for the indexer. */
+        const uint32_t *comp_row_array) {
+    float *out = (subs && comp_row_array)
+               ? (comp_cache_base + (uint64_t)comp_row_array[il] * head_dim)
+               : row;
     uint32_t d = blockIdx.x * blockDim.x + threadIdx.x;
     if (d >= head_dim) return;
     uint32_t coff = ratio == 4u ? 2u : 1u;
@@ -6859,7 +6946,7 @@ __global__ static void indexer_scores_kernel(
         float scale,
         int causal,
         const ds4_decode_scalars *subs, uint32_t il) {
-    const uint32_t n_comp_v = subs ? subs->n_comp[il] : n_comp;
+    const uint32_t n_comp_v = ds4_decode_n_comp_eff(subs, il, n_comp);
     uint32_t c = blockIdx.x;
     uint32_t t = blockIdx.y;
     if (c >= n_comp_v || t >= n_tokens) return;
@@ -6900,7 +6987,7 @@ __global__ static void indexer_score_one_direct_kernel(
         float scale,
         int causal,
         const ds4_decode_scalars *subs, uint32_t il) {
-    const uint32_t n_comp_v = subs ? subs->n_comp[il] : n_comp;
+    const uint32_t n_comp_v = ds4_decode_n_comp_eff(subs, il, n_comp);
     const uint32_t c = blockIdx.x;
     const uint32_t tid = threadIdx.x;
     const uint32_t lane = tid & 31u;
@@ -6950,7 +7037,7 @@ __global__ static void indexer_scores_wmma_kernel(
         const ds4_decode_scalars *subs, uint32_t il) {
 #if __CUDA_ARCH__ >= 700
     namespace wmma = nvcuda::wmma;
-    const uint32_t n_comp_v = subs ? subs->n_comp[il] : n_comp;
+    const uint32_t n_comp_v = ds4_decode_n_comp_eff(subs, il, n_comp);
     const uint32_t tile_c = blockIdx.x * 16u;
     const uint32_t tile_t = blockIdx.y * 16u;
     const uint32_t tid = threadIdx.x;
@@ -7060,7 +7147,7 @@ __global__ static void indexer_scores_wmma32_kernel(
         const ds4_decode_scalars *subs, uint32_t il) {
 #if __CUDA_ARCH__ >= 700
     namespace wmma = nvcuda::wmma;
-    const uint32_t n_comp_v = subs ? subs->n_comp[il] : n_comp;
+    const uint32_t n_comp_v = ds4_decode_n_comp_eff(subs, il, n_comp);
     const uint32_t tile_c = blockIdx.x * 32u;
     const uint32_t tile_t = blockIdx.y * 16u;
     const uint32_t tid = threadIdx.x;
@@ -7178,7 +7265,7 @@ __global__ static void indexer_scores_wmma64_kernel(
         const ds4_decode_scalars *subs, uint32_t il) {
 #if __CUDA_ARCH__ >= 700
     namespace wmma = nvcuda::wmma;
-    const uint32_t n_comp_v = subs ? subs->n_comp[il] : n_comp;
+    const uint32_t n_comp_v = ds4_decode_n_comp_eff(subs, il, n_comp);
     const uint32_t tile_c = blockIdx.x * 64u;
     const uint32_t tile_t = blockIdx.y * 16u;
     const uint32_t tid = threadIdx.x;
@@ -7296,7 +7383,7 @@ __global__ static void indexer_scores_wmma128_kernel(
         const ds4_decode_scalars *subs, uint32_t il) {
 #if __CUDA_ARCH__ >= 700
     namespace wmma = nvcuda::wmma;
-    const uint32_t n_comp_v = subs ? subs->n_comp[il] : n_comp;
+    const uint32_t n_comp_v = ds4_decode_n_comp_eff(subs, il, n_comp);
     const uint32_t tile_c = blockIdx.x * 128u;
     const uint32_t tile_t = blockIdx.y * 16u;
     const uint32_t tid = threadIdx.x;
@@ -7452,7 +7539,7 @@ __global__ static void argmax_kernel(int32_t *out_idx, const float *logits, uint
 
 __global__ static void indexer_topk_kernel(uint32_t *selected, const float *scores, uint32_t n_comp, uint32_t n_tokens, uint32_t top_k,
         const ds4_decode_scalars *subs, uint32_t il) {
-    const uint32_t n_comp_v = subs ? subs->n_comp[il] : n_comp;
+    const uint32_t n_comp_v = ds4_decode_n_comp_eff(subs, il, n_comp);
     uint32_t t = blockIdx.x;
     if (t >= n_tokens || threadIdx.x != 0) return;
     const float *row = scores + (uint64_t)t * n_comp_v;
@@ -7501,7 +7588,7 @@ __global__ static void indexer_topk_8192_cub_kernel(
     const uint32_t tid = threadIdx.x;
     if (t >= n_tokens || tid >= BLOCK_THREADS) return;
 
-    const uint32_t n_comp_v = subs ? subs->n_comp[il] : n_comp;
+    const uint32_t n_comp_v = ds4_decode_n_comp_eff(subs, il, n_comp);
     const float *row = scores + (uint64_t)t * n_comp_v;
     uint64_t keys[ITEMS_PER_THREAD];
 #pragma unroll
@@ -7532,7 +7619,7 @@ __global__ static void indexer_topk_1024_kernel(
         uint32_t n_tokens,
         uint32_t top_k,
         const ds4_decode_scalars *subs, uint32_t il) {
-    const uint32_t n_comp_v = subs ? subs->n_comp[il] : n_comp;
+    const uint32_t n_comp_v = ds4_decode_n_comp_eff(subs, il, n_comp);
     uint32_t t = blockIdx.x;
     uint32_t tid = threadIdx.x;
     if (t >= n_tokens || tid >= 1024u) return;
@@ -7583,7 +7670,7 @@ __global__ static void indexer_topk_pow2_kernel(
         uint32_t n_tokens,
         uint32_t top_k,
         const ds4_decode_scalars *subs, uint32_t il) {
-    const uint32_t n_comp_v = subs ? subs->n_comp[il] : n_comp;
+    const uint32_t n_comp_v = ds4_decode_n_comp_eff(subs, il, n_comp);
     uint32_t t = blockIdx.x;
     uint32_t tid = threadIdx.x;
     if (t >= n_tokens) return;
@@ -7638,16 +7725,18 @@ __global__ static void indexer_topk_pow2_u16_kernel(
         const float *scores,
         uint32_t n_comp,
         uint32_t n_tokens,
-        uint32_t top_k) {
+        uint32_t top_k,
+        const ds4_decode_scalars *subs, uint32_t il) {
+    const uint32_t n_comp_v = ds4_decode_n_comp_eff(subs, il, n_comp);
     uint32_t t = blockIdx.x;
     uint32_t tid = threadIdx.x;
     if (t >= n_tokens) return;
     __shared__ float vals[SORT_N];
     __shared__ uint16_t idxs[SORT_N];
 
-    const float *row = scores + (uint64_t)t * n_comp;
+    const float *row = scores + (uint64_t)t * n_comp_v;
     for (uint32_t i = tid; i < SORT_N; i += blockDim.x) {
-        if (i < n_comp) {
+        if (i < n_comp_v) {
             vals[i] = row[i];
             idxs[i] = (uint16_t)i;
         } else {
@@ -7694,19 +7783,21 @@ __global__ static void indexer_topk_chunk_pow2_kernel(
         uint32_t n_comp,
         uint32_t n_tokens,
         uint32_t top_k,
-        uint32_t candidate_stride) {
+        uint32_t candidate_stride,
+        const ds4_decode_scalars *subs, uint32_t il) {
+    const uint32_t n_comp_v = ds4_decode_n_comp_eff(subs, il, n_comp);
     uint32_t t = blockIdx.x;
     uint32_t chunk = blockIdx.y;
     uint32_t tid = threadIdx.x;
     if (t >= n_tokens) return;
 
     const uint32_t chunk_start = chunk * SORT_N;
-    if (chunk_start >= n_comp) return;
-    const uint32_t chunk_n = n_comp - chunk_start < SORT_N ? n_comp - chunk_start : SORT_N;
+    if (chunk_start >= n_comp_v) return;
+    const uint32_t chunk_n = n_comp_v - chunk_start < SORT_N ? n_comp_v - chunk_start : SORT_N;
     __shared__ float vals[SORT_N];
     __shared__ uint32_t idxs[SORT_N];
 
-    const float *row = scores + (uint64_t)t * n_comp;
+    const float *row = scores + (uint64_t)t * n_comp_v;
     for (uint32_t i = tid; i < SORT_N; i += blockDim.x) {
         if (i < chunk_n) {
             vals[i] = row[chunk_start + i];
@@ -7758,21 +7849,23 @@ __global__ static void indexer_topk_merge_pow2_kernel(
         uint32_t n_tokens,
         uint32_t top_k,
         uint32_t candidate_count,
-        uint32_t candidate_stride) {
+        uint32_t candidate_stride,
+        const ds4_decode_scalars *subs, uint32_t il) {
+    const uint32_t n_comp_v = ds4_decode_n_comp_eff(subs, il, n_comp);
     uint32_t t = blockIdx.x;
     uint32_t tid = threadIdx.x;
     if (t >= n_tokens) return;
     __shared__ float vals[SORT_N];
     __shared__ uint32_t idxs[SORT_N];
 
-    const float *row = scores + (uint64_t)t * n_comp;
+    const float *row = scores + (uint64_t)t * n_comp_v;
     const uint32_t *cand = candidates + (uint64_t)t * candidate_stride;
     for (uint32_t i = tid; i < SORT_N; i += blockDim.x) {
         uint32_t idx = UINT32_MAX;
         float v = -INFINITY;
         if (i < candidate_count) {
             idx = cand[i];
-            if (idx < n_comp) v = row[idx];
+            if (idx < n_comp_v) v = row[idx];
         }
         vals[i] = v;
         idxs[i] = idx;
@@ -7820,7 +7913,9 @@ __global__ static void indexer_topk_tree_merge_pow2_kernel(
         uint32_t n_sets,
         uint32_t merge_group,
         uint32_t candidate_stride,
-        uint32_t out_stride) {
+        uint32_t out_stride,
+        const ds4_decode_scalars *subs, uint32_t il) {
+    const uint32_t n_comp_v = ds4_decode_n_comp_eff(subs, il, n_comp);
     uint32_t t = blockIdx.x;
     uint32_t group = blockIdx.y;
     uint32_t tid = threadIdx.x;
@@ -7835,14 +7930,14 @@ __global__ static void indexer_topk_tree_merge_pow2_kernel(
     __shared__ float vals[SORT_N];
     __shared__ uint32_t idxs[SORT_N];
 
-    const float *row = scores + (uint64_t)t * n_comp;
+    const float *row = scores + (uint64_t)t * n_comp_v;
     const uint32_t *cand = candidates + (uint64_t)t * candidate_stride + set0 * top_k;
     for (uint32_t i = tid; i < SORT_N; i += blockDim.x) {
         uint32_t idx = UINT32_MAX;
         float v = -INFINITY;
         if (i < candidate_count) {
             idx = cand[i];
-            if (idx < n_comp) v = row[idx];
+            if (idx < n_comp_v) v = row[idx];
         }
         vals[i] = v;
         idxs[i] = idx;
@@ -8197,7 +8292,8 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
         }
         indexer_topk_pow2_u16_kernel<8192><<<n_tokens, 1024, 0, ds4_current_stream()>>>((uint32_t *)selected->ptr,
                                                                (const float *)scores->ptr,
-                                                               n_comp, n_tokens, top_k);
+                                                               n_comp, n_tokens, top_k,
+                                                               subs, il);
         return cuda_ok(cudaGetLastError(), "indexer topk 8192 launch");
     }
     if (top_k == 512u && getenv("DS4_CUDA_NO_TOPK2048") == NULL &&
@@ -8225,7 +8321,8 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
                                                                     n_comp,
                                                                     n_tokens,
                                                                     top_k,
-                                                                    candidate_stride);
+                                                                    candidate_stride,
+                                                                    subs, il);
         if (!cuda_ok(cudaGetLastError(), "indexer topk chunk launch")) return 0;
 
         while (n_sets > DS4_CUDA_TOPK_MERGE_GROUP) {
@@ -8243,7 +8340,8 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
                     n_sets,
                     DS4_CUDA_TOPK_MERGE_GROUP,
                     cur_stride,
-                    next_stride);
+                    next_stride,
+                    subs, il);
             if (!cuda_ok(cudaGetLastError(), "indexer topk tree merge launch")) return 0;
             cur = next;
             n_sets = next_sets;
@@ -8257,7 +8355,8 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
                                                                  n_tokens,
                                                                  top_k,
                                                                  n_sets * top_k,
-                                                                 cur_stride);
+                                                                 cur_stride,
+                                                                 subs, il);
         return cuda_ok(cudaGetLastError(), "indexer topk tree final launch");
     }
     indexer_topk_kernel<<<n_tokens, 1, 0, ds4_current_stream()>>>((uint32_t *)selected->ptr,
@@ -8752,10 +8851,18 @@ extern "C" int ds4_gpu_rms_norm_weight_tensor(ds4_gpu_tensor *out, const ds4_gpu
     const char *wptr = cuda_model_range_ptr(model_map, weight_offset, (uint64_t)n * sizeof(float), "rms_weight");
     if (!wptr) return 0;
     const float *w = (const float *)wptr;
-    rms_norm_weight_kernel<<<1, 256, 0, ds4_current_stream()>>>((float *)out->ptr, (const float *)x->ptr, w, n, 1, eps);
+    rms_norm_weight_kernel<<<1, 256, 0, ds4_current_stream()>>>((float *)out->ptr, (const float *)x->ptr, w, n, 1, eps,
+                                                                NULL, NULL, 0, NULL, 0);
     return cuda_ok(cudaGetLastError(), "rms_norm_weight launch");
 }
-extern "C" int ds4_gpu_rms_norm_weight_rows_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *x, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint32_t n, uint32_t rows, float eps) {
+/* Stage 3 (C11b): rows variant with the compressor redirect exposed.  The
+ * public shim below is the same call with the redirect disabled. */
+static int ds4_cuda_rms_norm_weight_rows_subs(ds4_gpu_tensor *out, const ds4_gpu_tensor *x, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint32_t n, uint32_t rows, float eps,
+        const ds4_decode_scalars *subs,
+        float *comp_cache_base,
+        uint32_t comp_head_dim,
+        const uint32_t *comp_row_array,
+        uint32_t comp_il) {
     if (!out || !x || !model_map || weight_offset > model_size ||
         model_size - weight_offset < (uint64_t)n * sizeof(float) ||
         out->bytes < (uint64_t)n * rows * sizeof(float) ||
@@ -8763,8 +8870,13 @@ extern "C" int ds4_gpu_rms_norm_weight_rows_tensor(ds4_gpu_tensor *out, const ds
     const char *wptr = cuda_model_range_ptr(model_map, weight_offset, (uint64_t)n * sizeof(float), "rms_weight");
     if (!wptr) return 0;
     const float *w = (const float *)wptr;
-    rms_norm_weight_kernel<<<rows, 256, 0, ds4_current_stream()>>>((float *)out->ptr, (const float *)x->ptr, w, n, rows, eps);
+    rms_norm_weight_kernel<<<rows, 256, 0, ds4_current_stream()>>>((float *)out->ptr, (const float *)x->ptr, w, n, rows, eps,
+                                                                   subs, comp_cache_base, comp_head_dim, comp_row_array, comp_il);
     return cuda_ok(cudaGetLastError(), "rms_norm_weight launch");
+}
+extern "C" int ds4_gpu_rms_norm_weight_rows_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *x, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint32_t n, uint32_t rows, float eps) {
+    return ds4_cuda_rms_norm_weight_rows_subs(out, x, model_map, model_size, weight_offset, n, rows, eps,
+                                              NULL, NULL, 0, NULL, 0);
 }
 extern "C" int ds4_gpu_dsv4_qkv_rms_norm_rows_tensor(
         ds4_gpu_tensor       *q_out,
@@ -8862,7 +8974,16 @@ extern "C" int ds4_gpu_attn_q_b_f16_head_rms_rope_tail_tensor(
 
 extern "C" int ds4_gpu_dsv4_fp8_kv_quantize_tensor(ds4_gpu_tensor *x, uint32_t n_tok, uint32_t head_dim, uint32_t n_rot) {
     if (!x || n_rot > head_dim || x->bytes < (uint64_t)n_tok * head_dim * sizeof(float)) return 0;
-    fp8_kv_quantize_kernel<<<n_tok, 64, 0, ds4_current_stream()>>>((float *)x->ptr, n_tok, head_dim, n_rot);
+    /* Stage 3 (C11b): the compressed attention row quantized in the decode path
+     * is addressed through a view whose pointer is baked at capture time.  The
+     * caller arms g_attn_comp_cache_base immediately before this call and
+     * disarms it immediately after, so the other consumers of this shim (raw KV
+     * row, prefill batches) keep the host-supplied pointer. */
+    const ds4_decode_scalars *subs = ds4_cuda_decode_scalars_ptr();
+    const uint32_t *row_arr = (subs && g_attn_comp_cache_base) ? &subs->comp_row[0] : NULL;
+    fp8_kv_quantize_kernel<<<n_tok, 64, 0, ds4_current_stream()>>>((float *)x->ptr, n_tok, head_dim, n_rot,
+                                                                   subs, g_attn_comp_cache_base, head_dim,
+                                                                   row_arr, g_current_layer_index);
     return cuda_ok(cudaGetLastError(), "fp8_kv_quantize launch");
 }
 extern "C" int ds4_gpu_dsv4_indexer_qat_tensor(ds4_gpu_tensor *x, uint32_t n_rows, uint32_t head_dim) {
@@ -8875,12 +8996,25 @@ extern "C" int ds4_gpu_dsv4_indexer_qat_tensor(ds4_gpu_tensor *x, uint32_t n_row
     indexer_hadamard_fp4_kernel<<<n_rows, 128, 0, ds4_current_stream()>>>((float *)x->ptr, n_rows, head_dim, subs, il, g_index_comp_cache_base);
     return cuda_ok(cudaGetLastError(), "indexer_hadamard_fp4 launch");
 }
-extern "C" int ds4_gpu_rope_tail_tensor(ds4_gpu_tensor *x, uint32_t n_tok, uint32_t n_head, uint32_t head_dim, uint32_t n_rot, uint32_t pos0, uint32_t n_ctx_orig, bool inverse, float freq_base, float freq_scale, float ext_factor, float attn_factor, float beta_fast, float beta_slow) {
+/* Stage 3 (C11b): rope tail with the compressor redirect exposed.  The public
+ * shim below is the same call with the redirect disabled. */
+static int ds4_cuda_rope_tail_subs(ds4_gpu_tensor *x, uint32_t n_tok, uint32_t n_head, uint32_t head_dim, uint32_t n_rot, uint32_t pos0, uint32_t n_ctx_orig, bool inverse, float freq_base, float freq_scale, float ext_factor, float attn_factor, float beta_fast, float beta_slow,
+        float *comp_cache_base,
+        uint32_t comp_head_dim,
+        const uint32_t *comp_row_array,
+        uint32_t comp_il,
+        uint32_t comp_rope_ratio) {
     if (!x || n_rot > head_dim || (n_rot & 1) || x->bytes < (uint64_t)n_tok * n_head * head_dim * sizeof(float)) return 0;
     uint32_t pairs = n_tok * n_head * (n_rot / 2);
     const ds4_decode_scalars *subs = ds4_cuda_decode_scalars_ptr();
-    rope_tail_kernel<<<(pairs + 255) / 256, 256, 0, ds4_current_stream()>>>((float *)x->ptr, n_tok, n_head, head_dim, n_rot, pos0, 1, n_ctx_orig, inverse ? 1 : 0, freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow, subs);
+    rope_tail_kernel<<<(pairs + 255) / 256, 256, 0, ds4_current_stream()>>>((float *)x->ptr, n_tok, n_head, head_dim, n_rot, pos0, 1, n_ctx_orig, inverse ? 1 : 0, freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow, subs,
+            comp_cache_base, comp_head_dim, comp_row_array, comp_il, comp_rope_ratio);
     return cuda_ok(cudaGetLastError(), "rope_tail launch");
+}
+extern "C" int ds4_gpu_rope_tail_tensor(ds4_gpu_tensor *x, uint32_t n_tok, uint32_t n_head, uint32_t head_dim, uint32_t n_rot, uint32_t pos0, uint32_t n_ctx_orig, bool inverse, float freq_base, float freq_scale, float ext_factor, float attn_factor, float beta_fast, float beta_slow) {
+    return ds4_cuda_rope_tail_subs(x, n_tok, n_head, head_dim, n_rot, pos0, n_ctx_orig, inverse,
+                                   freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow,
+                                   NULL, 0, NULL, 0, 0);
 }
 extern "C" int ds4_gpu_store_raw_kv_tensor(ds4_gpu_tensor *raw_cache, const ds4_gpu_tensor *kv, uint32_t raw_cap, uint32_t row, uint32_t head_dim);
 extern "C" int ds4_gpu_kv_fp8_store_raw_tensor(
@@ -9016,6 +9150,15 @@ extern "C" int ds4_gpu_compressor_update_tensor(
     if (!emit) return 1;
     const ds4_decode_scalars *subs = ds4_cuda_decode_scalars_ptr();
     const uint32_t il = g_current_layer_index;
+    /* Stage 3 (C11b): the emitted row index lives in the substrate so that a
+     * replayed graph writes the row of the token being decoded, not the one
+     * captured.  The attention compressor and the indexer one keep separate
+     * counters, hence separate arrays. */
+    const uint32_t *row_arr = NULL;
+    if (subs) {
+        row_arr = g_compressor_is_indexer ? &subs->index_row[0] : &subs->comp_row[0];
+    }
+    float *comp_cache_base = (float *)comp_cache->ptr;
     ds4_gpu_tensor *comp_row_view = ds4_gpu_tensor_view(
             comp_cache,
             (uint64_t)comp_row * head_dim * sizeof(float),
@@ -9028,17 +9171,22 @@ extern "C" int ds4_gpu_compressor_update_tensor(
             head_dim,
             ratio,
             subs,
-            (float *)comp_cache->ptr,
+            comp_cache_base,
             comp_row,
-            il);
+            il,
+            row_arr);
     int ok = cuda_ok(cudaGetLastError(), "compressor update pool launch");
-    if (ok) ok = ds4_gpu_rms_norm_weight_rows_tensor(comp_row_view, comp_row_view,
-                                                       model_map, model_size, norm_offset,
-                                                       head_dim, 1, rms_eps);
-    if (ok) ok = ds4_gpu_rope_tail_tensor(comp_row_view, 1, 1, head_dim, n_rot,
-                                            pos + 1u - ratio, n_ctx_orig, false,
-                                            freq_base, freq_scale, ext_factor, attn_factor,
-                                            beta_fast, beta_slow);
+    if (ok) ok = ds4_cuda_rms_norm_weight_rows_subs(comp_row_view, comp_row_view,
+                                                    model_map, model_size, norm_offset,
+                                                    head_dim, 1, rms_eps,
+                                                    subs, comp_cache_base, head_dim, row_arr, il);
+    /* The pooled row is rotated with its own position in the KV cache, which is
+     * pos + 1 - ratio, not the position of the token that triggered the emit. */
+    if (ok) ok = ds4_cuda_rope_tail_subs(comp_row_view, 1, 1, head_dim, n_rot,
+                                          pos + 1u - ratio, n_ctx_orig, false,
+                                          freq_base, freq_scale, ext_factor, attn_factor,
+                                          beta_fast, beta_slow,
+                                          comp_cache_base, head_dim, row_arr, il, ratio);
     ds4_gpu_tensor_free(comp_row_view);
     if (ok && ratio == 4u) {
         uint64_t half = 4ull * width;
@@ -9157,7 +9305,8 @@ extern "C" int ds4_gpu_compressor_prefill_tensor(
             rope_tail_kernel<<<(pairs + 255) / 256, 256, 0, ds4_current_stream()>>>(
                     (float *)comp_cache->ptr, n_comp, 1, head_dim, n_rot,
                     pos0, ratio, n_ctx_orig, 0, freq_base, freq_scale,
-                    ext_factor, attn_factor, beta_fast, beta_slow, NULL);
+                    ext_factor, attn_factor, beta_fast, beta_slow, NULL,
+                    NULL, 0, NULL, 0, 0);
             if (!cuda_ok(cudaGetLastError(), "compressor prefill rope launch")) return 0;
         }
         if (quantize_fp8 && !ds4_gpu_dsv4_fp8_kv_quantize_tensor(comp_cache, n_comp, head_dim, n_rot)) return 0;
@@ -9232,7 +9381,8 @@ extern "C" int ds4_gpu_compressor_prefill_ratio4_replay_tensor(
         rope_tail_kernel<<<(pairs + 255) / 256, 256, 0, ds4_current_stream()>>>(
                 (float *)comp_cache->ptr, n_comp, 1, head_dim, n_rot,
                 pos0, ratio, n_ctx_orig, 0, freq_base, freq_scale,
-                ext_factor, attn_factor, beta_fast, beta_slow, NULL);
+                ext_factor, attn_factor, beta_fast, beta_slow, NULL,
+                NULL, 0, NULL, 0, 0);
         if (!cuda_ok(cudaGetLastError(), "compressor replay rope launch")) return 0;
     }
     if (quantize_fp8 && !ds4_gpu_dsv4_fp8_kv_quantize_tensor(comp_cache, n_comp, head_dim, n_rot)) return 0;

@@ -25,6 +25,15 @@ void ds4_cuda_decode_scalars_alloc(void);
 void ds4_cuda_decode_scalars_unpopulate(void);
 void ds4_cuda_set_current_layer(uint32_t il);
 void ds4_cuda_set_index_comp_cache_base(ds4_gpu_tensor *cache);
+/* Arms the compressed-row redirect of ds4_gpu_dsv4_fp8_kv_quantize_tensor.
+ * Must be armed immediately before that call and disarmed with NULL
+ * immediately after: the shim also quantizes the raw KV row, which must keep
+ * its host-supplied pointer. */
+void ds4_cuda_set_attn_comp_cache_base(ds4_gpu_tensor *cache);
+/* Selects which compressed-row counter ds4_gpu_compressor_update_tensor reads
+ * from the decode substrate.  The shim signature is shared with the other GPU
+ * backends, so the discriminator travels beside the call. */
+void ds4_cuda_set_compressor_is_indexer(bool is_indexer);
 bool ds4_cuda_capture_active(void);
 void ds4_cuda_set_capture_active(bool active);
 
