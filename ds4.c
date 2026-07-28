@@ -15263,7 +15263,6 @@ static bool metal_graph_encode_decode_layer(
                                                             DS4_ROPE_YARN_BETA_SLOW,
                                                             DS4_RMS_EPS) != 0;
             if (ok && emit) {
-                ds4_cuda_set_index_comp_cache_base(g->layer_index_comp_cache[il]);
                 ds4_gpu_tensor *index_row_view = ds4_gpu_tensor_view(
                         g->layer_index_comp_cache[il],
                         (uint64_t)index_row * DS4_N_INDEXER_HEAD_DIM * sizeof(float),
@@ -15271,9 +15270,15 @@ static bool metal_graph_encode_decode_layer(
                 if (!index_row_view) {
                     ok = false;
                 } else {
+                    /* The row view address is baked into a captured graph; the
+                     * QAT re-derives it from the substrate while armed.  Disarm
+                     * on the next line: the sparse branch below reaches the same
+                     * shim for g->indexer_q, which must keep its own buffer. */
+                    ds4_cuda_set_index_comp_cache_base(g->layer_index_comp_cache[il]);
                     ok = ds4_gpu_dsv4_indexer_qat_tensor(index_row_view,
                                                           1,
                                                           DS4_N_INDEXER_HEAD_DIM) != 0;
+                    ds4_cuda_set_index_comp_cache_base(NULL);
                     ds4_gpu_tensor_free(index_row_view);
                 }
             }
